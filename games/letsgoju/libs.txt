@@ -1,0 +1,5 @@
+# Shared libraries the game ships in disk0, translated with it: file, load base.
+# NVIDIA's Cg compiler (the game compiles its shaders with it at run time) and
+# Xerces-C (XML). libCgGL's one function the game uses is in the runtime.
+libCg.so 0x0a000000
+libxerces-c.so.26 0x0b000000

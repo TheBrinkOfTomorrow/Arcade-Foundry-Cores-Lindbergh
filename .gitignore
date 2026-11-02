@@ -1,0 +1,26 @@
+# Build output, including the C the recompiler writes from a game binary
+build/
+build-*/
+gen/
+*.o
+
+# Fetched dependencies (gl.xml from the Khronos registry)
+extern/
+
+# The Python with capstone and pyelftools (build_cores.py in the app uses venv/bin/python)
+venv
+
+# Game data and anything derived from it — legal, not tidiness
+*.elf
+*.bin
+*.dat0
+*.dat1
+*.ppm
+*.7z
+*.zip
+*.iso
+*.img
+disk0/
+save/
+tmp/
+__pycache__/

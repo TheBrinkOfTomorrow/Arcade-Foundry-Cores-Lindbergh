@@ -1,0 +1,3 @@
+# symbol+offset bytes, applied to the code before translation
+# init_game_assign_data: a standard cabinet, as the game sets it up (games/outr2sdx)
+_Z21init_game_assign_datav+42 c6 43 15 00

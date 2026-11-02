@@ -1,0 +1,4 @@
+# symbol+offset bytes, applied to the code before translation
+# init_game_assign_data: a fresh save sets up a standard cabinet (one wheel), not the
+# twin cabinet (two wheels and drive boards) it defaults to
+_Z21init_game_assign_datav+4c c6 43 15 00

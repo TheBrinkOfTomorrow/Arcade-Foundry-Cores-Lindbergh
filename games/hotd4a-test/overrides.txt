@@ -1,0 +1,8 @@
+# The test-menu ELF links the same amLib dongle and DIP switch code as the game.
+amDongleInit
+amDongleIsAvailable
+amDongleUpdate
+amDipswInit
+amDipswExit
+amDipswGetData
+amDipswSetLed
