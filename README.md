@@ -165,3 +165,11 @@ Environment variables:
 ## Licence
 
 BSD-3-Clause. See `LICENSE` and `THIRD_PARTY.md`.
+
+## Version numbers
+
+The app and each game core are versioned separately. The release number on this
+repository (for example v1.0.0) is a snapshot label: it means "as shipped with
+Arcade Foundry: Insert Coin 1.0.0". Every game core also has its own x.y.z
+version (shown in the app), which can be higher or lower than the release number.
+A core's major number only changes when its saves stop carrying over.
