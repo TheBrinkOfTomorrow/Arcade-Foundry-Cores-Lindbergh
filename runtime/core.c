@@ -4,7 +4,9 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
+#include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -348,6 +350,48 @@ void x87_store80(uint32_t a, double v)
     }
     wr64(a, mant);
     wr16(a + 8, se);
+}
+
+// fnsave/frstor: the 108-byte 32-bit protected-mode image
+void x87_fnsave(CPU *c, uint32_t a)
+{
+    memset(M + a, 0, 108);
+    wr16(a, c->fcw);
+    wr16(a + 4, fstatus(c));
+    wr16(a + 8, 0);    // tag word: all valid (the tags are not tracked)
+    for (int i = 0; i < 8; i++) x87_store80(a + 28 + 10 * i, ST(i));
+    c->fcw = 0x37f;
+    c->fsw = 0;
+    c->ftop = 0;
+}
+
+void x87_frstor(CPU *c, uint32_t a)
+{
+    c->fcw = rd16(a);
+    uint16_t sw = rd16(a + 4);
+    c->ftop = (sw >> 11) & 7;
+    c->fsw = sw & ~0x3800;
+    for (int i = 0; i < 8; i++) ST(i) = x87_load80(a + 28 + 10 * i);
+}
+
+// C3 C2 C0 for the class of ST(0); C1 its sign
+void x87_fxam(CPU *c)
+{
+    double v = ST(0);
+    uint16_t cc;
+    if (isnan(v)) cc = 0x0100;
+    else if (isinf(v)) cc = 0x0500;
+    else if (v == 0.0) cc = 0x4000;
+    else if (fpclassify(v) == FP_SUBNORMAL) cc = 0x4400;
+    else cc = 0x0400;
+    if (signbit(v)) cc |= 0x0200;
+    c->fsw = (c->fsw & ~0x4700) | cc;
+}
+
+// int 0x2d is the Xbox kernel's debug service; a Linux game never uses it.
+void guest_debug_service(CPU *c, uint32_t service, uint32_t a, uint32_t b)
+{
+    (void)c; (void)service; (void)a; (void)b;
 }
 
 static int64_t round_mode(double v, int mode)
@@ -781,13 +825,17 @@ static int find_any_case(const char *dir, const char *name, char *out, size_t n)
 // Beach_wave.adx and beach_wave.adx, packed on a Mac as beach_wave.adx, and
 // the game asks for Beach_wave.adx. A path under the game folder that is not
 // there is looked up again in any case, a folder at a time.
+static void lexical(const char *in, char *out, size_t n);
+
 static void fix_case(char *buf, size_t n)
 {
-    size_t root = strlen(game_root);
+    char game[2048];
+    lexical(game_root, game, sizeof game);   // map_path's paths are in this form
+    size_t root = strlen(game);
     struct stat st;
-    if (!root || strncmp(buf, game_root, root) || buf[root] != '/' || stat(buf, &st) == 0 || errno != ENOENT) return;
+    if (!game_root[0] || !root || strncmp(buf, game, root) || buf[root] != '/' || stat(buf, &st) == 0 || errno != ENOENT) return;
     char out[2048], name[256];
-    snprintf(out, sizeof out, "%s", game_root);
+    snprintf(out, sizeof out, "%s", game);
     for (const char *p = buf + root; *p;) {
         while (*p == '/') p++;
         size_t len = strcspn(p, "/");
@@ -807,14 +855,106 @@ static void fix_case(char *buf, size_t n)
     if (strlen(out) < n) memcpy(buf, out, strlen(out) + 1);
 }
 
+// `in` made absolute (from the working directory) with "." and ".." taken out,
+// by its letters (symbolic links are not followed); "" when it does not fit.
+static void lexical(const char *in, char *out, size_t n)
+{
+    char whole[4096], cwd[PATH_MAX];
+    if (in[0] == '/') snprintf(whole, sizeof whole, "%s", in);
+    else if (getcwd(cwd, sizeof cwd)) snprintf(whole, sizeof whole, "%s/%s", cwd, in);
+    else {
+        out[0] = 0;
+        return;
+    }
+    size_t len = 0;
+    out[0] = 0;
+    for (const char *p = whole; *p;) {
+        while (*p == '/') p++;
+        size_t seg = strcspn(p, "/");
+        if (!seg) break;
+        if (seg == 2 && p[0] == '.' && p[1] == '.') {
+            while (len && out[len - 1] != '/') len--;
+            if (len) len--;
+            out[len] = 0;
+        } else if (!(seg == 1 && p[0] == '.')) {
+            if (len + 1 + seg >= n) {
+                out[0] = 0;
+                return;
+            }
+            out[len++] = '/';
+            memcpy(out + len, p, seg);
+            len += seg;
+            out[len] = 0;
+        }
+        p += seg;
+    }
+    if (!len && n > 1) out[0] = '/', out[1] = 0;
+}
+
+// whether `path` is `root` or under it
+static int path_under(const char *path, const char *root)
+{
+    size_t r = strlen(root);
+    return r > 1 && !strncmp(path, root, r) && (path[r] == 0 || path[r] == '/');
+}
+
+// whether `path` (lexical) is in the game folder or the save folder, by their
+// names as given or with their links followed (a chdir's folder is the latter)
+static pthread_mutex_t roots_lock = PTHREAD_MUTEX_INITIALIZER;
+static int inside_roots(const char *path)
+{
+    static char given[2][1024], real[2][PATH_MAX];   // the roots as last seen, and followed
+    const char *roots[2] = {game_root, save_root};
+    int in = 0;
+    pthread_mutex_lock(&roots_lock);
+    for (int i = 0; i < 2 && !in; i++) {
+        if (!roots[i][0]) continue;
+        if (strcmp(given[i], roots[i])) {
+            snprintf(given[i], sizeof given[i], "%s", roots[i]);
+            if (!realpath(roots[i], real[i])) real[i][0] = 0;
+        }
+        char name[2048];
+        lexical(roots[i], name, sizeof name);
+        in = path_under(path, name) || (real[i][0] && path_under(path, real[i]));
+    }
+    pthread_mutex_unlock(&roots_lock);
+    return in;
+}
+
+// `p` under `dir` ("/home", "/tmp"): what follows it, or NULL
+static const char *below(const char *p, const char *dir)
+{
+    size_t n = strlen(dir);
+    if (strncmp(p, dir, n) || (p[n] && p[n] != '/')) return NULL;
+    return p + n + (p[n] == '/');
+}
+
+// A path the game asked for, on this machine: the cabinet's disk is mounted at
+// /home (the game folder), /tmp and /var/tmp are the save folder's tmp/, and
+// relative paths start in the program's folder (or where it chdir'd). Anything
+// that would land outside the game and save folders ("../" past them, another
+// absolute path) is refused: "" (no such file), logged the first few times.
+// /dev/null, zero, random and urandom are the host's (host_device_hidden).
 const char *map_path(const char *p, char *buf, size_t n)
 {
-    // the cabinet's disk is mounted at /home; game paths are relative to elf/
-    if (!strncmp(p, "/home/", 6)) snprintf(buf, n, "%s/%s", game_root, p + 6);
-    else if (!strncmp(p, "/tmp/", 5)) snprintf(buf, n, "%s/tmp/%s", save_root[0] ? save_root : game_root, p + 5);
-    else if (!strncmp(p, "/var/tmp/", 9)) snprintf(buf, n, "%s/tmp/%s", save_root[0] ? save_root : game_root, p + 9);
-    else if (p[0] != '/' && elf_dir[0]) snprintf(buf, n, "%s/%s", elf_dir, p);
-    else snprintf(buf, n, "%s", p);
+    const char *tmp_root = save_root[0] ? save_root : game_root, *rest;
+    char asked[4096];
+    if ((rest = below(p, "/home"))) snprintf(asked, sizeof asked, "%s/%s", game_root, rest);
+    else if ((rest = below(p, "/tmp")) || (rest = below(p, "/var/tmp"))) snprintf(asked, sizeof asked, "%s/tmp/%s", tmp_root, rest);
+    else if (p[0] != '/') snprintf(asked, sizeof asked, "%s/%s", elf_dir[0] ? elf_dir : game_root, p);
+    else if (!strncmp(p, "/dev/", 5) && !host_device_hidden(p)) {
+        snprintf(buf, n, "%s", p);
+        return buf;
+    } else asked[0] = 0;
+    char norm[2048] = "";
+    if (asked[0] && game_root[0]) lexical(asked, norm, sizeof norm);
+    if (!norm[0] || !inside_roots(norm) || strlen(norm) >= n) {
+        static int refused;
+        if (refused < 20) refused++, hle_log("refused %s: outside the game and save folders\n", p);
+        if (n) buf[0] = 0;
+        return buf;
+    }
+    memcpy(buf, norm, strlen(norm) + 1);
     fix_case(buf, n);
     return buf;
 }

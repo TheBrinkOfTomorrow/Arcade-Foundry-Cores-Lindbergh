@@ -12,10 +12,14 @@
 //   restart                                     destroy and create again
 //   surfaces                                    take the screen as surfaces from now on (5.1, Apple)
 //   end                                         stop
-// CORE_TEST_PACE=1 runs at the core's frame rate, as the front end does, for games
+// CORE_TEST_PACE=1 runs at the core's frame rate (CORE_TEST_PACE=40: at 40 a
+// second, a slow host), as the front end does, for games
 // that time their loading by the clock (OutRun 2 SP); otherwise as fast as it goes.
+// CORE_TEST_EVERY=N prints the progress line every N frames (default 600).
+// CORE_TEST_OPTION=name=value sets one of the core's options (afcore 5.3) first.
 #include "afcore.h"
 #include <dlfcn.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,6 +76,14 @@ int main(int argc, char **argv)
         perror(argv[5]);
         return 1;
     }
+    const char *opt = getenv("CORE_TEST_OPTION");
+    if (opt && strchr(opt, '=')) {
+        char name[64];
+        snprintf(name, sizeof name, "%.*s", (int)(strchr(opt, '=') - opt), opt);
+        int ok = api->size >= offsetof(afcore_api, set_option) + sizeof api->set_option && api->set_option
+                     ? api->set_option(name, strchr(opt, '=') + 1) : -1;
+        printf("option %s: %s\n", opt, ok == 0 ? "set" : "not taken");
+    }
     char err[512];
     afcore *core = api->create(argv[3], argv[4], err, sizeof err);
     if (!core) {
@@ -86,6 +98,7 @@ int main(int argc, char **argv)
     char cmd[32] = "", arg1[200] = "", arg2[32] = "";
     double t0 = now(), audio_peak = 0;
     int pace = getenv("CORE_TEST_PACE") != NULL;
+    double pace_hz = pace && atof(getenv("CORE_TEST_PACE")) > 1 ? atof(getenv("CORE_TEST_PACE")) : 0;
     int surfaces = 0, surfaces_seen = 0;
     size_t audio_frames = 0;
     static float buf[48000 * 2];
@@ -143,7 +156,7 @@ int main(int argc, char **argv)
             if (api->screen_surface(core, &sw, &sh) && !surfaces_seen++) printf("frame %d: a surface %dx%d\n", frame, sw, sh);
         }
         if (pace) {
-            double due = t0 + (frame + 1) / api->frame_hz;
+            double due = t0 + (frame + 1) / (pace_hz ? pace_hz : api->frame_hz);
             while (now() < due) {
                 struct timespec ts = {0, 1000000};
                 nanosleep(&ts, NULL);
@@ -161,8 +174,9 @@ int main(int argc, char **argv)
             break;
         }
         frame++;
-        if (frame % 600 == 0)
-            printf("frame %d: %.1f fps, audio %zu frames, peak %.3f\n", frame, frame / (now() - t0), audio_frames, audio_peak);
+        if (frame % (getenv("CORE_TEST_EVERY") ? atoi(getenv("CORE_TEST_EVERY")) : 600) == 0)
+            printf("frame %d: %.1f fps, audio %zu frames (%.0f a second), peak %.3f\n", frame, frame / (now() - t0), audio_frames,
+                   audio_frames / (now() - t0), audio_peak);
     }
 done:
     printf("end at frame %d: %.1f fps, audio %zu frames, peak %.3f\n", frame, frame / (now() - t0), audio_frames, audio_peak);

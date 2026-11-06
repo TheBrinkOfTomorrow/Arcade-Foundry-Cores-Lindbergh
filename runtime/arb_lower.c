@@ -216,6 +216,32 @@ char *arb_lower_nv(char *src)
     src = unroll_loops(src);
     int vertex = !strncmp(src, "!!ARBvp", 7);
 
+    // outputs written under a condition (Let's Go Jungle's
+    // "MUL result.texcoord[0].xyz(GT.x), ..."): the old value is needed and
+    // an output cannot be read, so they are written in a temporary each
+    // (lbOut0...) and copied out at the end
+    char outs[8][64];
+    int nouts = 0;
+    for (const char *l = src; *l && nouts < 8;) {
+        const char *e = strchr(l, '\n');
+        size_t len = e ? (size_t)(e - l) : strlen(l);
+        const char *r = l;
+        while (*r == ' ' || *r == '\t') r++;
+        r += strspn(r, "ABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789");
+        while (*r == ' ' || *r == '\t') r++;
+        size_t dl = strcspn(r, ",;\n");
+        if (r < l + len && !strncmp(r, "result.", 7) && memchr(r, '(', dl)) {
+            char tok[64];
+            snprintf(tok, sizeof tok, "%.*s", (int)strcspn(r, "("), r);
+            char *dot = strrchr(tok, '.');
+            if (dot && dot[1] && strspn(dot + 1, "xyzw") == strlen(dot + 1) && !strchr(dot, ']')) *dot = 0;
+            int seen = 0;
+            for (int k = 0; k < nouts; k++) seen |= !strcmp(outs[k], tok);
+            if (!seen) snprintf(outs[nouts++], sizeof outs[0], "%s", tok);
+        }
+        l += len + (e ? 1 : 0);
+    }
+
     struct out o = {0};
     int declared = 0, open_statement = 0;
     char *buf = NULL;
@@ -253,7 +279,26 @@ char *arb_lower_nv(char *src)
         if (!declared) {   // the clamp's temporary and constants, ahead of everything else
             puts_(&o, "TEMP lbSat, lbAbs0, lbAbs1, lbAbs2, lbHC, lbCnd, lbMask;\n"
                       "PARAM lbZeroOne = { 0, 1, 0, 0 };\n");
+#ifndef LB_IOS
+            if (vertex && (strstr(src, "SIN") || strstr(src, "COS")))
+                puts_(&o, "TEMP lbSC;\n"
+                          "PARAM lbSinA = { 1, -0.16666667, 0.0083333333, -0.00019841270 };\n"
+                          "PARAM lbSinB = { 2.7557319e-6, -2.5052108e-8, 1.6059044e-10, -3.14159265 };\n"
+                          "PARAM lbSinC = { 0.15915494, 0.5, 0.75, 6.2831853 };\n");
+#endif
+            for (int k = 0; k < nouts; k++) {
+                char l[64];
+                snprintf(l, sizeof l, "TEMP lbOut%d;\n", k);
+                puts_(&o, l);
+            }
             declared = 1;
+        }
+        if (nouts && starts_word(s, "END")) {
+            for (int k = 0; k < nouts; k++) {
+                char l[160];
+                snprintf(l, sizeof l, "MOV %s, lbOut%d;\n", outs[k], k);
+                puts_(&o, l);
+            }
         }
         if (starts_word(s, "SHORT") || starts_word(s, "LONG")) {
             s += strspn(s, "SHORTLONG");
@@ -310,6 +355,17 @@ char *arb_lower_nv(char *src)
         char a[4][512];
         int na = split_args(args, a);
         if (na < 1) goto give_up;
+        for (int k = 0; k < nouts; k++) {
+            size_t tl = strlen(outs[k]);
+            const char *rest = a[0] + tl;   // nothing, a write mask, a condition
+            if (!strncmp(a[0], outs[k], tl) &&
+                (!*rest || *rest == '(' || (*rest == '.' && strchr("(", rest[1 + strspn(rest + 1, "xyzw")]) &&
+                                            strspn(rest + 1, "xyzw")))) {
+                char t[520];
+                snprintf(t, sizeof t, "lbOut%d%s", k, rest);
+                snprintf(a[0], sizeof a[0], "%s", t);
+            }
+        }
         if (swap) {   // SGT d, x, y -> SLT d, y, x
             if (na != 3) goto give_up;
             char t[512];
@@ -373,6 +429,30 @@ char *arb_lower_nv(char *src)
         // ARL's source is a scalar (Cg writes ARL A0.x, R0)
         if (!strcmp(base, "ARL") && na == 2 && !strchr(strrchr(a[1], ']') ? strrchr(a[1], ']') : a[1], '.'))
             strcat(a[1], ".x");
+#ifndef LB_IOS
+        // SIN and COS, which vp40 has in vertex programs and ARB doesn't
+        // (Mesa: Let's Go Jungle's frogs): the angle brought into -pi..pi,
+        // then sin's series to x^13 (gl4es takes them as they are)
+        if (vertex && (!strcmp(base, "SIN") || !strcmp(base, "COS")) && na == 2) {
+            char *br = strrchr(a[1], ']');
+            if (!strchr(br ? br : a[1], '.')) strcat(a[1], ".x");
+            char l[1600];
+            snprintf(l, sizeof l,
+                     "MAD lbSC.x, %s, lbSinC.x, lbSinC.%c;\n"
+                     "FRC lbSC.x, lbSC.x;\n"
+                     "MAD lbSC.x, lbSC.x, lbSinC.w, lbSinB.w;\n"
+                     "MUL lbSC.y, lbSC.x, lbSC.x;\n"
+                     "MAD lbSC.z, lbSC.y, lbSinB.z, lbSinB.y;\n"
+                     "MAD lbSC.z, lbSC.z, lbSC.y, lbSinB.x;\n"
+                     "MAD lbSC.z, lbSC.z, lbSC.y, lbSinA.w;\n"
+                     "MAD lbSC.z, lbSC.z, lbSC.y, lbSinA.z;\n"
+                     "MAD lbSC.z, lbSC.z, lbSC.y, lbSinA.y;\n"
+                     "MAD lbSC.z, lbSC.z, lbSC.y, lbSinA.x;\n"
+                     "MUL%s %s, lbSC.z, lbSC.x;\n",
+                     a[1], base[0] == 'C' ? 'z' : 'y', sat && !clamp ? "_SAT" : "", a[0]);
+            puts_(&o, l);
+        } else {
+#endif
         puts_(&o, base);
         if (sat && !clamp) puts_(&o, "_SAT");
         for (int k = 0; k < na; k++) {
@@ -380,6 +460,9 @@ char *arb_lower_nv(char *src)
             puts_(&o, a[k]);
         }
         puts_(&o, ";\n");
+#ifndef LB_IOS
+        }
+#endif
         if (clamp) {   // dst = min(max(lbSat, 0), 1)
             char l[1200];
             snprintf(l, sizeof l, "MAX lbSat, lbSat, lbZeroOne.x;\nMIN %s, lbSat, lbZeroOne.y;\n", dst);
@@ -571,6 +654,103 @@ char *arb_inline_constants(char *src)
     puts_(&o, at);
     free(decl.p);
     free(body.p);
+    free(src);
+    return o.p;
+}
+
+// Relative addressing with no offset (c[A0.x]): gl4es's ARB parser takes only
+// c[A0.x + n] and rejects the program ("Invalid state"; Let's Go Jungle's and
+// Sega Race TV's skinning). The offset is written out as + 0.
+char *arb_address_offsets(char *src)
+{
+    if (!strstr(src, "[A0.x]")) return src;
+    struct out o = {0};
+    puts_(&o, "");
+    for (char *p = src, *q; (q = strstr(p, "[A0.x]")); p = q + 6) {
+        put(&o, p, (size_t)(q - p));
+        puts_(&o, "[A0.x + 0]");
+        if (!strstr(q + 6, "[A0.x]")) puts_(&o, q + 6);
+    }
+    free(src);
+    return o.p;
+}
+
+// Shadow lookups (OutRun 2 SP's car and scenery, #78). NVIDIA compares a
+// 2D lookup's r with the depth texture's value when the texture's compare
+// mode is on (ARB_shadow), whatever the program says; gl4es writes every 2D
+// lookup as texture2D(sampler, coord.xy), and OpenGL ES 3 compares only
+// through a shadow sampler. Each 2D TEX and TXP on units 0-3 of a fragment
+// program also makes the comparison (the stored depth at least the
+// reference: GL_LEQUAL) and keeps it where program environment parameter
+// 18 + unit has x 1, which the runtime sets while a compare-mode texture is
+// bound there (hle_gfx.c); the texture itself is sampled with no compare.
+// Outside [0, 1] on an axis the texture clamps to its border (z for s, w for
+// t: OutRun 2 SP's shadow map, CLAMP_TO_BORDER, which gl4es makes
+// CLAMP_TO_EDGE) the comparison is with the border depth (y) instead.
+#define SHADOW_ENV 18
+char *arb_shadow_lookups(char *src)
+{
+    if (strncmp(src, "!!ARBfp", 7)) return src;
+    for (int u = 0; u < 4; u++) {
+        char env[32];
+        snprintf(env, sizeof env, "program.env[%d]", SHADOW_ENV + u);
+        if (strstr(src, env)) return src;   // the program's own: left alone
+    }
+    struct out o = {0};
+    puts_(&o, "");
+    int any = 0;
+    const char *decl_at;   // where TEMPs may go: after the header and its OPTIONs
+    const char *p = strchr(src, '\n');
+    decl_at = p ? p + 1 : src + strlen(src);
+    for (const char *q = decl_at; (q = strstr(q, "OPTION")); q += 6) {
+        const char *e = strchr(q, ';');
+        if (e) decl_at = e + 1;
+    }
+    put(&o, src, (size_t)(decl_at - src));
+    puts_(&o, "\nTEMP _shT, _shS, _shC, _shB, _shO;\nPARAM _shK = {0, 1, 0, 0};\n");
+    for (const char *s = decl_at; *s;) {
+        const char *e = strchr(s, ';');
+        if (!e) { puts_(&o, s); break; }
+        const char *t = s;
+        while (*t == ' ' || *t == '\t' || *t == '\n' || *t == '\r') t++;
+        int txp = starts_word(t, "TXP") || starts_word(t, "TXP_SAT");
+        int tex = starts_word(t, "TEX") || starts_word(t, "TEX_SAT");
+        char a[4][512];
+        int unit = -1;
+        if ((tex || txp) && split_args(t + (strncmp(t + 3, "_SAT", 4) ? 3 : 7), a) == 4 && !strcmp(a[3], "2D")
+            && sscanf(a[2], "texture[%d]", &unit) == 1 && unit >= 0 && unit < 4) {
+            int sat = !strncmp(t + 3, "_SAT", 4);
+            char line[4096], env[32];
+            snprintf(env, sizeof env, "program.env[%d]", SHADOW_ENV + unit);
+            put(&o, s, (size_t)(t - s));
+            // the coordinate, divided for TXP
+            snprintf(line, sizeof line, "MOV _shS, %s;\n%s", a[1],
+                     txp ? "RCP _shB.w, _shS.w;\nMUL _shS, _shS, _shB.wwww;\n" : "");
+            puts_(&o, line);
+            snprintf(line, sizeof line,
+                     "TEX _shT, _shS, %s, 2D;\n"
+                     "SGE _shC, _shT.xxxx, _shS.zzzz;\n"          // the texel's comparison
+                     "SGE _shB, %s.yyyy, _shS.zzzz;\n"            // the border's
+                     "SLT _shO.x, _shS.x, _shK.x;\nSLT _shO.y, _shK.y, _shS.x;\n"
+                     "SLT _shO.z, _shS.y, _shK.x;\nSLT _shO.w, _shK.y, _shS.y;\n"
+                     "MAX _shO.xz, _shO.xxzz, _shO.yyww;\n"       // outside on s, on t
+                     "MUL _shO.xz, _shO, %s.zzww;\n"              // and that axis clamps to the border
+                     "MAX _shO.x, _shO.x, _shO.z;\n"
+                     "LRP _shC, _shO.xxxx, _shB, _shC;\n"
+                     "LRP _shT, %s.xxxx, _shC, _shT;\n"
+                     "MOV%s %s, _shT",
+                     a[2], env, env, env, sat ? "_SAT" : "", a[0]);
+            puts_(&o, line);
+            any = 1;
+        } else
+            put(&o, s, (size_t)(e - s));
+        puts_(&o, ";");
+        s = e + 1;
+    }
+    if (!any) {
+        free(o.p);
+        return src;
+    }
     free(src);
     return o.p;
 }

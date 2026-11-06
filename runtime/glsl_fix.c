@@ -268,7 +268,7 @@ static char *strip_comments(const char *src)
 // reads a varying the vertex shader does not write.
 #define MAX_VARY 64
 #define MAX_DEPTH 16
-typedef struct { char type[16], name[64], cond[1024]; } vary;
+typedef struct { char type[16], name[64], cond[8192]; } vary;
 
 // is identifier w (length wn) written anywhere in s: w[...][.swz] followed by an
 // assignment operator, or ++/--
@@ -337,8 +337,9 @@ static char *fix_varyings(const char *src, const char *missing)
     char *s = strip_comments(src);
     static vary v[MAX_VARY];
     int nv = 0;
-    // directive lines of each open #if level, in order
-    char levels[MAX_DEPTH][512];
+    // directive lines of each open #if level, in order (Race TV's longest
+    // #if is 551 characters: cut short, it left the #if unterminated)
+    static char levels[MAX_DEPTH][4096];
     int depth = 0;
     sbuf o = {0};
     size_t n = strlen(s), main_open = 0;
@@ -770,9 +771,47 @@ static int uses_rect_textures(const char *s)
 char *glsl_preprocess(const char *src);   // glsl_pp.c
 #endif
 
+// text after #else or #endif, which NVIDIA ignores and Mesa refuses (Race
+// TV's "#else( ( NNGLD_OPT_TEX_USER4 != -1 ) )": the shader failed, and its
+// race was drawn white): dropped
+static char *fix_directives(const char *src)
+{
+    sbuf o = {0};
+    size_t n = strlen(src);
+    for (size_t i = 0; i < n;) {
+        size_t e = i;
+        while (e < n && src[e] != '\n') e++;
+        size_t k = i;
+        while (k < e && (src[k] == ' ' || src[k] == '\t')) k++;
+        size_t end = e;
+        if (k < e && src[k] == '#') {
+            size_t d = k + 1;
+            while (d < e && (src[d] == ' ' || src[d] == '\t')) d++;
+            size_t w = d;
+            while (w < e && is_ident(src[w])) w++;
+            if ((w - d == 4 && !strncmp(src + d, "else", 4)) || (w - d == 5 && !strncmp(src + d, "endif", 5))) {
+                size_t t = w;
+                while (t < e && isspace((unsigned char)src[t])) t++;
+                if (t < e && src[t] != '/') end = w;
+            }
+        }
+        put(&o, src + i, end - i);
+        if (end < e && src[e - 1] == '\r') put(&o, "\r", 1);
+        if (e < n) put(&o, "\n", 1);
+        i = e + 1;
+    }
+    if (!o.p) puts_(&o, "");
+    return o.p;
+}
+
+// when this file was built, for hle_gfx.c's cache of the fixed text
+const char glsl_fix_build[] = __DATE__ " " __TIME__;
+
 char *glsl_fix(const char *src, int fragment, const char *missing)
 {
-    char *r = fix_rect_textures(src), *k0 = fix_const_locals(r), *k = fix_array_inits(k0);
+    char *d = fix_directives(src);
+    char *r = fix_rect_textures(d), *k0 = fix_const_locals(r), *k = fix_array_inits(k0);
+    free(d);
     free(r);
     free(k0);
     char *a = fix_syntax(k);

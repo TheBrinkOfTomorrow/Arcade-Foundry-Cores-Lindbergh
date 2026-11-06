@@ -1,4 +1,4 @@
-// The game as an Arcade Foundry core (include/afcore.h): the front end calls
+// The game as an Arcade Foundry core (common/include/afcore.h): the front end calls
 // run_frame, the game runs on threads of its own and hands over each frame
 // it finishes in host_present, where it waits for the next run_frame.
 //
@@ -6,12 +6,17 @@
 // library. When one exits (TEST pressed in the game, EXIT in the menu) the
 // core ends all its threads, puts the runtime back to power-on state and
 // starts the other, as the cabinet's start script does.
+#include "af_debug.h"
 #include "afcore.h"
+#ifdef CORE_FILELIST
+#include "afc_filelist.h" // filelists/<set>.h: every file of a known-good copy
+#endif
 #include "hle.h"
 #include "host.h"
 #include "input.h"
 #include <errno.h>
 #include <pthread.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -42,6 +47,7 @@ void host_gl_close(void);
 int host_gl_surfaces(void);   // host_core_ios.m
 void *host_gl_surface_frame(void);
 void host_gl_surface_read(void *surface, uint32_t *dst, int w, int h);
+void host_gl_frame_pool(void);   // drains the drawing thread's autorelease pool
 #endif
 
 AFCORE_EXPORT const afcore_api *API_FN(CORE_ROMSET)(void);
@@ -76,6 +82,7 @@ static int fresh;                       // frames[1] is newer than [0]
 static afcore_input pending;
 static uint32_t last_buttons;
 static uint16_t lever;     // driving: the gear lever's switch (Race TV)
+static double lever_until; // monotonic seconds the lever stays out after a press
 static float audio[AUDIO_CAP * 2];
 static size_t audio_head, audio_len;
 
@@ -118,7 +125,7 @@ static void perf_frame(double start, double cpu_start, double read, double copie
 #ifdef LB_IOS
         perf.on = 1;
 #else
-        perf.on = getenv("LB_PERF") ? 1 : -1;
+        perf.on = af_debug_env("LB_PERF") ? 1 : -1;
 #endif
         gl_prof = perf.on > 0;
     }
@@ -151,6 +158,18 @@ static void perf_frame(double start, double cpu_start, double read, double copie
     perf.last_cpu = thread_cpu();
 }
 
+// the game's boot screen (LB_BOOT_TEXT, hle_libc.c): its frames don't wait
+// for the front end, which is shown the latest when it asks
+static int booting(void)
+{
+#ifdef LB_BOOT_TEXT
+    extern int lb_booting;
+    return lb_booting > 0;
+#else
+    return 0;
+#endif
+}
+
 void host_present(void)
 {
     double t_start = perf_now(), cpu_start = thread_cpu();
@@ -158,10 +177,11 @@ void host_present(void)
     host_gl_size(&w, &h);
     size_t n = (size_t)w * h;
 #ifdef LB_IOS
+    host_gl_frame_pool();
     pthread_mutex_lock(&lock);
     int surfaces = surfaces_on;
     pthread_mutex_unlock(&lock);
-    if (surfaces && !getenv("LB_NO_SURFACES") && host_gl_surfaces()) {
+    if (surfaces && !af_debug_env("LB_NO_SURFACES") && host_gl_surfaces()) {
         // the GPU copies the frame for the front end: nothing comes back to the CPU
         void *s = host_gl_surface_frame();
         double t_read = perf_now();
@@ -174,7 +194,7 @@ void host_present(void)
         frame_seq++;
         double t_copy = perf_now();
         pthread_cond_broadcast(&cv);
-        while (!go && !guest_stopping) pthread_cond_wait(&cv, &lock);
+        while (!go && !guest_stopping && !booting()) pthread_cond_wait(&cv, &lock);
         go = 0;
         pthread_mutex_unlock(&lock);
         perf_frame(t_start, cpu_start, t_read, t_copy, perf_now());
@@ -182,6 +202,16 @@ void host_present(void)
         return;
     }
 #endif
+    if (booting()) {
+        // the front end has the last frame until it asks for another
+        pthread_mutex_lock(&lock);
+        int asked = go;
+        pthread_mutex_unlock(&lock);
+        if (!asked) {
+            perf_frame(t_start, cpu_start, t_start, t_start, perf_now());
+            return;
+        }
+    }
     if (readback_cap < n) {
         free(readback);
         readback = calloc(n, 4);   // black until the first frame is read back
@@ -204,8 +234,8 @@ void host_present(void)
     frame_seq++;
     double t_copy = perf_now();
     pthread_cond_broadcast(&cv);
-    // lockstep with the front end: wait for the next run_frame
-    while (!go && !guest_stopping) pthread_cond_wait(&cv, &lock);
+    // lockstep with the front end: wait for the next run_frame (not while booting)
+    while (!go && !guest_stopping && !booting()) pthread_cond_wait(&cv, &lock);
     go = 0;
     pthread_mutex_unlock(&lock);
     perf_frame(t_start, cpu_start, t_read, t_copy, perf_now());
@@ -217,6 +247,21 @@ static uint16_t gun_axis(float v)
     if (v < 0) v = 0;
     if (v > 1) v = 1;
     return (uint16_t)(v * 65535.0f + 0.5f);
+}
+
+// a gun axis between the raw values at its two edges (LB_GUN_RANGE: the
+// game's own calibration, which ignores what lies outside it)
+#ifdef LB_GUN_RANGE
+static const uint16_t gun_edges[4] = {LB_GUN_RANGE};
+#else
+static const uint16_t gun_edges[4] = {0, 0xffff, 0, 0xffff};
+#endif
+static uint16_t gun_raw(float v, int y)
+{
+    if (v < 0) v = 0;
+    if (v > 1) v = 1;
+    float a = gun_edges[2 * y], b = gun_edges[2 * y + 1];
+    return (uint16_t)(a + v * (b - a) + 0.5f);
 }
 
 static int on_screen(float x, float y) { return x >= 0 && x <= 1 && y >= 0 && y <= 1; }
@@ -235,18 +280,31 @@ void host_input(void)
     jvs_in.analog[0] = gun_axis((in.steer + 1) / 2);
     jvs_in.analog[1] = gun_axis(in.accel);
     jvs_in.analog[2] = gun_axis(in.brake);
-    // the lever stays where it was put (neutral until first moved); gear is ignored:
-    // front ends send it with the shift buttons
-    if (rise & AFCORE_SHIFT_UP) lever = SW_UP;
-    if (rise & AFCORE_SHIFT_DOWN) lever = SW_DOWN;
+    // the gear lever is sequential and springs back to neutral: each push up or
+    // down shifts one gear. It is out while the shift button is held, and for at
+    // least LEVER_MIN_S after a press, so a quick paddle tap is not missed (by
+    // time, not calls: host_input runs from XPending too, several times a frame).
+    // Holding it out (the old latch) gave the game one edge each way, so it only
+    // shifted between 1st and 2nd, and name entry read it as player 2 up held.
+    // gear is ignored: front ends send it with the shift buttons.
+    const double LEVER_MIN_S = 0.05;
+    double now = perf_now();
+    if (rise & AFCORE_SHIFT_UP) lever = SW_UP, lever_until = now + LEVER_MIN_S;
+    else if (rise & AFCORE_SHIFT_DOWN) lever = SW_DOWN, lever_until = now + LEVER_MIN_S;
+    else if (now >= lever_until && !(b & (lever == SW_UP ? AFCORE_SHIFT_UP : AFCORE_SHIFT_DOWN))) lever = 0;
     p[1] |= lever;
     if (b & (AFCORE_BUTTON2 | AFCORE_VIEW2)) p[1] |= SW_1;   // boost
     if (b & AFCORE_VIEW1) p[0] |= SW_DOWN;
 #else
     const uint32_t trigger[2] = {AFCORE_TRIGGER1, AFCORE_TRIGGER2};
     for (int i = 0; i < 2; i++) {
-        jvs_in.analog[2 * i] = gun_axis(in.gun_x[i]);
-        jvs_in.analog[2 * i + 1] = gun_axis(in.gun_y[i]);
+#ifdef LB_GUN_SWAP_XY
+        jvs_in.analog[2 * i] = gun_raw(in.gun_y[i], 1);
+        jvs_in.analog[2 * i + 1] = gun_raw(in.gun_x[i], 0);
+#else
+        jvs_in.analog[2 * i] = gun_raw(in.gun_x[i], 0);
+        jvs_in.analog[2 * i + 1] = gun_raw(in.gun_y[i], 1);
+#endif
         // as in the other gun cores, a shot off screen reloads (the cabinet's
         // reload is a switch in the gun)
         if (!on_screen(in.gun_x[i], in.gun_y[i]) && (b & trigger[i])) p[i] |= SW_2;
@@ -396,6 +454,7 @@ static afcore *create(const char *rom_path, const char *save_dir, char *err, siz
     afcore *c = calloc(1, sizeof *c);
     segaboot_test = 0;   // a new core starts with the game
     lever = 0;
+    lever_until = 0;
     // rom_path: the game's folder, the one holding disk0
     snprintf(c->root, sizeof c->root, "%s", rom_path);
     size_t len = strlen(c->root);
@@ -429,11 +488,16 @@ static afcore *create(const char *rom_path, const char *save_dir, char *err, siz
         snprintf(save_root, sizeof save_root, "%s", save_dir);
         mkdir(save_root, 0755);
     } else {
-        // nothing kept: the saves go to a scratch folder
-        snprintf(save_root, sizeof save_root, "%s/lindbergh-%d", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", (int)getpid());
-        mkdir(save_root, 0755);
+        // nothing kept: the saves go to a new scratch folder of their own
+        snprintf(save_root, sizeof save_root, "%s/lindbergh-XXXXXX", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+        if (!mkdtemp(save_root)) {
+            snprintf(err, err_size, "no scratch folder for the saves (%s): %s", save_root, strerror(errno));
+            save_root[0] = 0;
+            free(c);
+            return NULL;
+        }
     }
-    hle_verbose = getenv("LB_VERBOSE") != NULL;
+    hle_verbose = af_debug_env("LB_VERBOSE") != NULL;
     memset(&pending, 0, sizeof pending);
     pending.gun_x[0] = pending.gun_x[1] = pending.gun_y[0] = pending.gun_y[1] = 0.5f;
     last_buttons = 0;
@@ -599,12 +663,50 @@ static const char *error(afcore *c)
     return e;
 }
 
+#ifdef CORE_FILELIST
+// afcore 5.2: the game folder against the list made from a known-good copy
+// (tools/filelist in common/): every listed file, its size and CRC.
+static int check_roms(const char *rom_path, char *report, size_t report_size)
+{
+    char root[1024];
+    snprintf(root, sizeof root, "%s", rom_path ? rom_path : "");
+    size_t len = strlen(root);
+    while (len > 1 && root[len - 1] == '/') root[--len] = 0;
+    return afc_check_files(root, afc_filelist, AFC_FILELIST_COUNT, report, report_size);
+}
+#define CHECK_ROMS check_roms
+#else
+#define CHECK_ROMS NULL // no list for this game yet
+#endif
+
+// the settings the front end chooses (CORE_OPTIONS, from games/<game>/
+// game.cmake's GAME_OPTIONS): the region, for the games whose region the
+// runtime answers (hle_lindbergh.c)
+#ifdef CORE_OPTIONS
+extern int lb_region;
+static int set_option(const char *name, const char *value)
+{
+    static const char *const regions[] = {"export", "usa", "japan"};
+    if (strcmp(name, "region")) return -1;
+    for (int i = 0; i < 3; i++)
+        if (!strcmp(value, regions[i])) {
+            lb_region = i;
+            return 0;
+        }
+    return -1;
+}
+#define OPTIONS CORE_OPTIONS
+#else
+#define OPTIONS NULL
+#define set_option NULL
+#endif
+
 const afcore_api *API_FN(CORE_ROMSET)(void)
 {
     static const afcore_api api = {
         AFCORE_API_VERSION, sizeof(afcore_api), AFCORE_MAKE_VERSION(CORE_VERSION_MAJOR, CORE_VERSION_MINOR, CORE_VERSION_PATCH), STR(CORE_ROMSET), CORE_TITLE,
         60.0, CORE_WIDTH, CORE_HEIGHT, create, destroy, run_frame, screen, audio_rate, audio_read, save,
-        link_start, link_state, error, NULL, NULL, NULL, 0.0f, screen_surface,
+        link_start, link_state, error, NULL, NULL, NULL, 0.0f, screen_surface, CHECK_ROMS, OPTIONS, set_option,
     };
     return &api;
 }

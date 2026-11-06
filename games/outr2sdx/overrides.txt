@@ -11,3 +11,5 @@ amDipswSetLed
 # The frame clock its file loader is timed by, less the time in OpenGL
 _Z20SetFrameStartCpuTimev
 _Z13GetNowCpuTimev
+# CRI Sofdec's inverse DCT, natively (runtime/sofdec_idct.h, #49)
+DCT_IsseTrans

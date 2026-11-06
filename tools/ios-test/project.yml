@@ -1,0 +1,57 @@
+# XcodeGen spec for Lindbergh Test (main.m), core_test as an iPhone/iPad app.
+# run.sh writes the project here (git-ignored) and the cores to embed into
+# build-ios-test/cores/. Signing: DEVELOPMENT_TEAM from the command line.
+# The bundle ID is its own (Arcade Foundry stays as it is on the device);
+# like the app it needs extended virtual addressing for the game's 4 GB window.
+name: LindberghTest
+options:
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  LindberghTest:
+    type: application
+    platform: iOS
+    sources:
+      - path: main.m
+      - path: ../core_test.c
+        compilerFlags: [-Dmain=core_test_main]
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: Lindbergh Test
+        UILaunchScreen: {}
+        UIApplicationSceneManifest: { UIApplicationSupportsMultipleScenes: false }
+        UIRequiresFullScreen: true
+        UIStatusBarHidden: true
+        UIFileSharingEnabled: true
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+        UISupportedInterfaceOrientations~ipad: [UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+    entitlements:
+      path: LindberghTest.entitlements
+      properties:
+        com.apple.developer.kernel.extended-virtual-addressing: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.thebrinkoftomorrow.lindberghtest
+        CODE_SIGN_STYLE: Automatic
+        TARGETED_DEVICE_FAMILY: "1,2"
+        HEADER_SEARCH_PATHS: $(SRCROOT)/../../common/include
+        LD_RUNPATH_SEARCH_PATHS: "@executable_path/Frameworks"
+        GENERATE_INFOPLIST_FILE: NO
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+    postCompileScripts:
+      - name: Embed the cores
+        basedOnDependencyAnalysis: false
+        script: |
+          DST="$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH"
+          mkdir -p "$DST"
+          for fw in "$SRCROOT/../../build-ios-test/cores"/afcore_*.framework; do
+            [ -d "$fw" ] || continue
+            rm -rf "$DST/$(basename "$fw")"
+            cp -R "$fw" "$DST/"
+            plist="$DST/$(basename "$fw")/Info.plist"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $PRODUCT_BUNDLE_IDENTIFIER.$(basename "$fw" .framework | tr _ -)" "$plist"
+            /usr/libexec/PlistBuddy -c "Add :MinimumOSVersion string $IPHONEOS_DEPLOYMENT_TARGET" "$plist" 2>/dev/null || true
+            [ -n "$EXPANDED_CODE_SIGN_IDENTITY" ] && codesign --force --sign "$EXPANDED_CODE_SIGN_IDENTITY" --timestamp=none "$DST/$(basename "$fw")"
+          done

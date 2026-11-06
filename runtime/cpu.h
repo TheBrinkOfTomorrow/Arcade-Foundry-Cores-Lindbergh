@@ -29,6 +29,7 @@ typedef union {
     int16_t sw[4];
     uint32_t u[2];
     int32_t i[2];
+    int8_t sb[8];
     uint64_t q;
 } mmx_t;
 
@@ -84,6 +85,11 @@ static inline uint32_t parity8(uint32_t v) { return !__builtin_parity(v & 0xff);
 // 80-bit extended values in memory (fld/fstp tbyte) are converted to double.
 double x87_load80(uint32_t a);
 void x87_store80(uint32_t a, double v);
+// fnsave/frstor (the 108-byte 32-bit image) and fxam. The shared x86recomp
+// (common/tools/x86recomp) emits these; same code as the Chihiro runtime.
+void x87_fnsave(CPU *c, uint32_t a);
+void x87_frstor(CPU *c, uint32_t a);
+void x87_fxam(CPU *c);
 
 #define ST(i) c->st[(c->ftop + (i)) & 7]
 static inline void fpush(CPU *c, double v) { c->ftop = (c->ftop - 1) & 7; c->st[c->ftop] = v; }
@@ -153,6 +159,8 @@ void guest_port_out(CPU *c, uint16_t port, uint32_t value, int size);
 uint32_t guest_port_in(CPU *c, uint16_t port, int size);
 void guest_cpuid(CPU *c, uint32_t *a, uint32_t *b, uint32_t *cc, uint32_t *d);
 uint64_t guest_rdtsc(CPU *c);
+// int 0x2d (the Xbox kernel's debug service): nothing on Lindbergh, kept for the shared recompiler
+void guest_debug_service(CPU *c, uint32_t service, uint32_t a, uint32_t b);
 void guest_bad_return(CPU *c, uint32_t from, uint32_t expected, uint32_t got);
 
 #ifdef __cplusplus

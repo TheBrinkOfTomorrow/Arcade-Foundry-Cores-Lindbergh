@@ -6,6 +6,7 @@
 // synth parameters. Effects sends (FX slots) are not
 // mixed. Games such as HotD4 also pace movie playback by a voice's position,
 // so position and status advance in real time even without an audio device.
+#include "af_debug.h"
 #include "hle.h"
 #include "host.h"
 #include <math.h>
@@ -23,6 +24,8 @@
 enum { SYNTH_ATTENUATION = 0, SYNTH_PITCH = 1 };   // 0.1 dB of attenuation; cents
 
 enum { STATUS_STOP = 0, STATUS_ACTIVE = 1, STATUS_PAUSE = 2, STATUS_INVALID = -1 };
+// PlayWithSetup's voice settings
+enum { VOICE_START_LOOP = 0x100, VOICE_END_LOOP, VOICE_END_OFFSET, VOICE_PLAY_POSITION, VOICE_LOOP_STATE };
 enum { FMT_U8 = 0x0004, FMT_S16 = 0x0020 };
 
 typedef struct {
@@ -151,29 +154,45 @@ static void wav_header(void)
     fseek(wav, 0, SEEK_END);
 }
 
-// Without a host audio thread (a core, or LB_FRAME_CLOCK=1) sound advances 1/60 s
-// per video frame, which also keeps movies and music in step on a slow host. A
-// frame the game itself holds for more than one vsync (HotD4's cutscenes run at
-// 30 frames/s, FrameRateMgr) advances it by the vsyncs that passed: the time
-// since the last frame in 60ths of a second, rounded, 1 to 4. Before, those
-// cutscenes made half a second of sound a second and their voices broke up.
+// Without a host audio thread (a core, or LB_FRAME_CLOCK=1) sound is made
+// once per video frame, as much as the time since the last frame: the sound
+// board plays in real time whatever the game's frame rate. Before, a frame
+// counted as a whole number of 60ths of a second (HotD4's 30 frames/s
+// cutscenes as two): at 40 or 50 frames/s that made a third more or a sixth
+// less sound than time passed, the front end's queue filled and was dropped,
+// or ran dry (Race TV on Linux: stutter, sounds over each other). A gap of
+// more than 1/10 s (a pause, the window dragged) counts as one frame.
 static int frame_clock;
-static double last;   // when the last frame's sound was made
+static double last;      // when the last frame's sound was made
+static double owed;      // the fraction of an output frame carried to the next
 
 void audio_frame(void)
 {
+    if (af_debug_env("LB_VOICELOG")) {   // the voices playing, once a second
+        static int n;
+        if (++n % 60 == 0) {
+            int act = 0;
+            pthread_mutex_lock(&lock);
+            for (int i = 0; i < MAX_VOICES; i++) act += voices[i].used && voices[i].status == STATUS_ACTIVE;
+            pthread_mutex_unlock(&lock);
+            hle_log("voices: %d playing\n", act);
+        }
+    }
     if (!frame_clock) return;
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     double now = ts.tv_sec + ts.tv_nsec * 1e-9;
-    int n = last > 0 ? (int)lround((now - last) * 60) : 1;
+    double dt = last > 0 ? now - last : 1.0 / 60;
     last = now;
-    if (n < 1) n = 1;
-    if (n > 4) n = 4;
-    int16_t buf[OUT_RATE / 60 * 2];
-    for (int i = 0; i < n; i++) {
-        audio_mix(buf, OUT_RATE / 60);
-        host_audio_push(buf, OUT_RATE / 60);
+    if (dt < 0 || dt > 0.1) dt = 1.0 / 60;
+    owed += dt * OUT_RATE;
+    int n = (int)owed;
+    owed -= n;
+    static int16_t buf[OUT_RATE / 10 * 2 + 2];
+    if (n > OUT_RATE / 10) n = OUT_RATE / 10;
+    if (n > 0) {
+        audio_mix(buf, n);
+        host_audio_push(buf, n);
     }
 }
 
@@ -182,7 +201,7 @@ static void audio_open(void)
     if (opened) return;
     opened = 1;
     for (int i = 0; i < 16; i++) io_vol[i] = 1.0;
-    const char *w = getenv("LB_AUDIO_WAV");
+    const char *w = af_debug_env("LB_AUDIO_WAV");
     if (w && (wav = fopen(w, "wb"))) wav_header();
     frame_clock = !host_audio_open(OUT_RATE);
     if (frame_clock) hle_log("audio: advancing with video frames\n");
@@ -198,7 +217,7 @@ void hle_audio_reset(void)
     wav_bytes = 0;
     memset(voices, 0, sizeof voices);
     opened = frame_clock = 0;
-    last = 0;
+    last = owed = 0;
 }
 
 // ---- API -----------------------------------------------------------------------------
@@ -364,6 +383,21 @@ static void h_play_with_setup(CPU *c)
     for (uint32_t i = 0; i < ARG(3); i++) {
         uint32_t e = ARG(4) + 12 * i, ch = rd32(e), send = rd32(e + 4);
         if (ch < MAX_CH && send < MAX_SENDS) v->send_level[ch][send] = rd32(e + 8) / VOL_MAX;
+    }
+    // the voice's own settings, {ioctl, value, 0} each: Sega Race TV plays every
+    // sound this way out of one 48 MB sample bank, and without them each sound
+    // started at the bank's start and ran on through the others
+    for (uint32_t i = 0; i < ARG(5); i++) {
+        uint32_t e = ARG(6) + 12 * i, value = rd32(e + 4);
+        pthread_mutex_lock(&lock);
+        switch (rd32(e)) {
+        case VOICE_START_LOOP: v->start_loop = value; break;
+        case VOICE_END_LOOP: v->end_loop = value; break;
+        case VOICE_END_OFFSET: v->end_offset = value; break;
+        case VOICE_PLAY_POSITION: v->pos = (uint64_t)(value / frame_bytes(v)) << 32; break;
+        case VOICE_LOOP_STATE: v->loop = value != 0; break;
+        }
+        pthread_mutex_unlock(&lock);
     }
     for (uint32_t i = 0; i < ARG(7); i++) set_synth(v, rd32(ARG(8) + 8 * i), (int32_t)rd32(ARG(8) + 8 * i + 4));
     v->status = STATUS_ACTIVE;

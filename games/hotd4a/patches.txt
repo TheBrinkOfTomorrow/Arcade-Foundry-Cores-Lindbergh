@@ -1,3 +1,6 @@
 # symbol+offset bytes, applied to the code before translation
 # JvsMgr_CheckDongleDecrypt: report the I/O board's key check as passed
 _Z25JvsMgr_CheckDongleDecryptv+ae c7 42 04 01 00 00 00
+# amJvsInit (AM library, every Lindbergh game) sleeps a second before it
+# looks for the I/O board, at each start: the emulated board is there at once
+amJvsInit+105 00

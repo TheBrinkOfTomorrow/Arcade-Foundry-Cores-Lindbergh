@@ -7,7 +7,7 @@ gen/
 # Fetched dependencies (gl.xml from the Khronos registry)
 extern/
 
-# The Python with capstone and pyelftools (build_cores.py in the app uses venv/bin/python)
+# An old per-checkout venv (now the shared ~/venvs/afic: common/tools/afic-venv)
 venv
 
 # Game data and anything derived from it — legal, not tidiness

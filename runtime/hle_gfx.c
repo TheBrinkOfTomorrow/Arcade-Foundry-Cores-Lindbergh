@@ -1,5 +1,6 @@
 // X11 and GLX for a game that expects a single full-screen window, on the
 // host's GL context (host.h). GLX pbuffers become framebuffer objects in it.
+#include "af_debug.h"
 #include "gl_host.h"
 #include "host.h"
 #include "input.h"
@@ -292,7 +293,12 @@ static void h_cgGLIsProfileSupported(CPU *c)
 {
     switch (ARG(0)) {
     case 6150: case 7000: RET(1);                                     // arbvp1, arbfp1
-    case 7001: RET(host_has_extension("GL_NV_vertex_program3"));      // vp40
+    // gl4es (iOS) and Mesa (Linux) list no NVIDIA option, but arb_lower.c
+    // lowers vp40's for them: with arbvp1 Let's Go Jungle compiled most of its
+    // skinning for 20 bones (and three shaders not at all), while its heads'
+    // vp40 program, made for 64, was given no bones (the characters drawn as
+    // shards and streaks on iOS, slabs and bars on Linux)
+    case 7001: RET(1);                                                // vp40
     case 6151: RET(host_has_extension("GL_NV_fragment_program2"));    // fp40
     }
     RET(0);
@@ -359,7 +365,7 @@ static void save_shot(void)
     unsigned char *px = malloc((size_t)w * h * 3);
     // LB_SHOT_FBO=N: the game's framebuffer object N instead of the screen
     static int fbo = -1;
-    if (fbo < 0) fbo = getenv("LB_SHOT_FBO") ? atoi(getenv("LB_SHOT_FBO")) : 0;
+    if (fbo < 0) fbo = af_debug_env("LB_SHOT_FBO") ? atoi(af_debug_env("LB_SHOT_FBO")) : 0;
     if (fbo) {
         GLint prev;
         glGetIntegerv(GL_FRAMEBUFFER_BINDING_EXT, &prev);
@@ -393,6 +399,19 @@ static void h_glXSwapBuffers(CPU *c)
         for (GLenum e; (e = glGetError()) != GL_NO_ERROR;) hle_log("GL error 0x%x before frame %d\n", e, frame);
     if (shot_every && frame % shot_every == 0) save_shot();
     host_present();
+#ifdef LB_BOOT_TEXT
+    // the boot's fast clock only after a frame its limiter held (one 1/60 s and
+    // a margin at most: without the fast clock the limiter itself makes a frame
+    // last 1/60 s), not after one whose work took longer (hle_libc.c)
+    extern int lb_booting, lb_boot_clock;
+    static double boot_last;
+    struct timespec bt;
+    clock_gettime(CLOCK_MONOTONIC, &bt);
+    double boot_now = bt.tv_sec + bt.tv_nsec * 1e-9;
+    lb_boot_clock = boot_last > 0 && boot_now - boot_last < 1.25 / 60;
+    boot_last = boot_now;
+    if (lb_booting > 0) lb_booting--;
+#endif
     audio_frame();
     input_poll();
     if (frame % 600 == 0) hle_log("frame %d\n", frame);
@@ -682,9 +701,13 @@ static void glsl_cache_save(uint64_t key, const char *text)
 
 static char *glsl_fix_cached(const char *src, int fragment, const char *missing)
 {
+    // the build of this file and of glsl_fix.c's (a change to that alone
+    // kept its old text: Race TV's shaders, cut short, from the cache)
     static const char build[] = __DATE__ " " __TIME__;
+    extern const char glsl_fix_build[];
     if (!glsl_cache_loaded) glsl_cache_load();
     uint64_t key = fnv64(14695981039346656037ull, build, sizeof build);
+    key = fnv64(key, glsl_fix_build, strlen(glsl_fix_build));
     key = fnv64(key, &fragment, sizeof fragment);
     key = fnv64(key, missing ? missing : "", missing ? strlen(missing) + 1 : 1);
     key = fnv64(key, src, strlen(src));
@@ -701,7 +724,7 @@ static void set_shader_source(GLuint sh, const char *src, int fragment, int arb,
     typedef void (APIENTRY *fn)(GLuint, GLsizei, const GLchar **, const GLint *);
     fn p = (fn)gl_host_proc(arb ? "glShaderSourceARB" : "glShaderSource");
     char *fixed = glsl_fix_cached(src, fragment, missing);
-    if (getenv("LB_SHADER_DUMP")) {
+    if (af_debug_env("LB_SHADER_DUMP")) {
         static int seq;
         char path[64];
         snprintf(path, sizeof path, "shader_%03d.glsl", seq++);
@@ -934,7 +957,7 @@ static void link_program(CPU *c, int arb)
         }
         if (!added) break;
         if (hle_verbose) hle_log("program %u: relinking without inputs %s\n", prog, missing);
-        if (getenv("LB_SHADER_DUMP") && !attempt)
+        if (af_debug_env("LB_SHADER_DUMP") && !attempt)
             for (int i = 0; i < 1024; i++)
                 if (attached[i].prog == prog)
                     for (int k = 0; k < 4; k++) {
@@ -1007,13 +1030,95 @@ static char *alias_vertex_inputs(const char *src, size_t n)
 // A0.y/z/w live in a temporary instead, and each instruction that indexes
 // with one loads it into a second address register's x just before.
 // (A vertex program indexes one parameter array per instruction.)
+// ARB_vertex_program has one address register with one component, so on
+// OpenGL ES (gl4es) and Mesa a program using A0.y/z/w or a second register
+// (Let's Go Jungle's skinning has A0.xyzw and A1) is refused: "address
+// registers limit exceeded", and what it draws (the characters' heads) was
+// missing. Every address value is kept in a temporary instead (A0's in lbAI,
+// A1's in lbAJ), and each instruction that indexes loads the one it uses into
+// A0.x first. Mesa also refuses offsets past ARB's -64..63 (Let's Go Jungle's
+// c[A0.x + 199]): those are added to the address before it is loaded.
+static int far_offset(const char *src)
+{
+    for (const char *p = src; (p = strstr(p, "A")); p++)
+        if ((p[1] == '0' || p[1] == '1') && p[2] == '.' && p[3] && strchr("xyzw", p[3])) {
+            const char *q = p + 4;
+            while (*q == ' ') q++;
+            if ((*q == '+' || *q == '-') && atoi(q + 1) > (*q == '-' ? 64 : 63)) return 1;
+        }
+    return 0;
+}
+
+static char *one_address_register(char *src)
+{
+    if (!strstr(src, "OPTION NV_vertex_program") ||
+        !(strstr(src, "A0.y") || strstr(src, "A0.z") || strstr(src, "A0.w") || strstr(src, "ADDRESS A1") ||
+          far_offset(src)))
+        return src;
+    size_t n = strlen(src);
+    char *out = malloc(n * 3 + 256), *o = out;
+    for (char *line = src; *line;) {
+        char *end = strchr(line, '\n');
+        size_t len = end ? (size_t)(end - line + 1) : strlen(line);
+        char buf[512];
+        snprintf(buf, sizeof buf, "%.*s", (int)(len < sizeof buf ? len : sizeof buf - 1), line);
+        line += len;
+        char *op = buf + strspn(buf, " \t");
+        if (strstr(buf, "ADDRESS A0;")) {
+            o += sprintf(o, "%sTEMP lbAI, lbAJ, lbAO;\n", buf);
+        } else if (strstr(buf, "ADDRESS A1;")) {
+            continue;
+        } else if (!strncmp(op, "ARL", 3) && (op[3] == ' ' || op[3] == '\t')) {
+            // ARL A0.yz, R1: lbAI.y from R1.y, lbAI.z from R1.z (a one-component swizzle for each)
+            char dst[64] = "", reg[128] = "";
+            if (sscanf(op + 3, " %63[^, ] , %127[^;]", dst, reg) != 2) { o += sprintf(o, "%s", buf); continue; }
+            const char *tmp = dst[1] == '1' ? "lbAJ" : "lbAI";
+            const char *mask = strchr(dst, '.') ? strchr(dst, '.') + 1 : dst[1] == '1' ? "x" : "xyzw";
+            char *dot = strrchr(reg, '.'), sw[8] = "";
+            if (dot && !strchr(dot, ']')) { snprintf(sw, sizeof sw, "%s", dot + 1); *dot = 0; }
+            for (const char *m = mask; *m && strchr("xyzw", *m); m++) {
+                int k = *m == 'x' ? 0 : *m == 'y' ? 1 : *m == 'z' ? 2 : 3;
+                size_t l = strlen(sw);
+                char c = !l ? *m : l == 1 ? sw[0] : sw[k < (int)l ? k : (int)l - 1];
+                o += sprintf(o, "MOV %s.%c, %s.%c;\n", tmp, *m, reg, c);
+            }
+        } else {
+            // the address it indexes with, loaded into A0.x
+            char *a = NULL;
+            for (char *q = buf; *q && !a; q++)
+                if ((q[0] == 'A' && (q[1] == '0' || q[1] == '1') && q[2] == '.' && strchr("xyzw", q[3])) && (q == buf || !isalnum((unsigned char)q[-1]))) a = q;
+            if (!a) { o += sprintf(o, "%s", buf); continue; }
+            const char *tmp = a[1] == '1' ? "lbAJ" : "lbAI";
+            char *sign = a + 4;
+            while (*sign == ' ') sign++;
+            int off = *sign == '+' || *sign == '-' ? atoi(sign + 1) * (*sign == '-' ? -1 : 1) : 0;
+            char *close = strchr(a, ']');
+            if ((off < -64 || off > 63) && close) {
+                o += sprintf(o, "ADD lbAO.x, %s.%c, {%d};\nARL A0.x, lbAO.x;\n", tmp, a[3], off);
+                *a = 0;
+                o += sprintf(o, "%sA0.x%s", buf, close);
+                continue;
+            }
+            o += sprintf(o, "ARL A0.x, %s.%c;\n", tmp, a[3]);
+            for (char *q = buf; *q; q++) {
+                if (q == a) { o += sprintf(o, "A0.x"); q += 3; }
+                else *o++ = *q;
+            }
+        }
+    }
+    *o = 0;
+    free(src);
+    if (hle_verbose) hle_log("vertex program: its address registers kept in temporaries\n");
+    return out;
+}
+
 static char *split_address_components(char *src)
 {
-#ifdef LB_IOS   // gl4es has A0.x only, so always (the names here do not clash with the game's A1)
-    if (!strstr(src, "OPTION NV_vertex_program") ||
-#else
-    if (!strstr(src, "OPTION NV_vertex_program") || strstr(src, "ADDRESS A1") ||
+#ifdef LB_IOS   // gl4es has A0.x only
+    return one_address_register(src);
 #endif
+    if (!host_has_nv_options()) return one_address_register(src);   // and so has Mesa's ARB
+    if (!strstr(src, "OPTION NV_vertex_program") || strstr(src, "ADDRESS A1") ||
         !(strstr(src, "A0.y") || strstr(src, "A0.z") || strstr(src, "A0.w")))
         return src;
     size_t n = strlen(src);
@@ -1025,7 +1130,7 @@ static char *split_address_components(char *src)
         snprintf(buf, sizeof buf, "%.*s", (int)(len < sizeof buf ? len : sizeof buf - 1), line);
         char *arl = strstr(buf, "ARL"), *a0 = strstr(buf, "A0."), *decl = strstr(buf, "ADDRESS A0;");
         if (decl) {
-            o += sprintf(o, "%sADDRESS lbA1;\nTEMP lbAI;\n", buf);
+            o += sprintf(o, "%sADDRESS lbA1;\nTEMP lbAI, lbAO;\n", buf);
         } else if (arl && a0 && a0 > arl && strchr("yzw", a0[3])) {
             // ARL A0.k, src: keep the value of src's k-th component
             int k = a0[3] == 'y' ? 1 : a0[3] == 'z' ? 2 : 3;
@@ -1041,12 +1146,25 @@ static char *split_address_components(char *src)
             o += sprintf(o, "MOV lbAI.%c, %s.%c;\n", "xyzw"[k], reg, comp);
         } else if (a0 && strchr("yzw", a0[3])) {
             char k = a0[3];
-            o += sprintf(o, "ARL lbA1.x, lbAI.%c;\n", k);
-            for (char *q = buf; *q; q++) {
-                if (!strncmp(q, "A0.", 3) && q[3] == k) {
-                    o += sprintf(o, "lbA1.x");
-                    q += 3;
-                } else *o++ = *q;
+            // an offset past ARB's -64..63 (vp40 allows more: Sega Race TV's
+            // skinning reads c[A0.y + 96], and Mesa refused the program, its
+            // scenery missing) is added to the address instead
+            char *sign = a0 + 4;
+            while (*sign == ' ') sign++;
+            int off = *sign == '+' || *sign == '-' ? atoi(sign + 1) * (*sign == '-' ? -1 : 1) : 0;
+            char *close = strchr(a0, ']');
+            if ((off < -64 || off > 63) && close) {
+                o += sprintf(o, "ADD lbAO.x, lbAI.%c, {%d};\nARL lbA1.x, lbAO.x;\n", k, off);
+                *a0 = 0;
+                o += sprintf(o, "%slbA1.x%s", buf, close);
+            } else {
+                o += sprintf(o, "ARL lbA1.x, lbAI.%c;\n", k);
+                for (char *q = buf; *q; q++) {
+                    if (!strncmp(q, "A0.", 3) && q[3] == k) {
+                        o += sprintf(o, "lbA1.x");
+                        q += 3;
+                    } else *o++ = *q;
+                }
             }
         } else {
             o += sprintf(o, "%s", buf);
@@ -1063,7 +1181,9 @@ static char *split_address_components(char *src)
 char *arb_lower_nv(char *src);
 char *arb_matrix_rows(char *src);
 char *arb_inline_constants(char *src);
+char *arb_address_offsets(char *src);
 int arb_fog_env(char *src);
+char *arb_shadow_lookups(char *src);
 
 static GLint rejected_pos = -1;
 static char rejected_msg[256];
@@ -1081,7 +1201,7 @@ static void arb_fallback(void (APIENTRY *p)(GLenum, GLenum, GLsizei, const void 
     // drawing with a program that failed draws nothing on the desktop: these
     // put every vertex outside the view and discard every fragment
     const char *plain = target == GL_VERTEX_PROGRAM_ARB
-        ? "!!ARBvp1.0\nPARAM out = { 0, 0, 2, 1 };\nMOV result.position, out;\nEND\n"
+        ? "!!ARBvp1.0\nPARAM away = { 0, 0, 2, 1 };\nMOV result.position, away;\nEND\n"   // not "out": GLSL's
         : "!!ARBfp1.0\nPARAM no = { -1, -1, -1, -1 };\nKIL no;\nMOV result.color, fragment.color;\nEND\n";
     p(target, format, (GLsizei)strlen(plain), plain);
     rejected_pos = pos;
@@ -1138,12 +1258,13 @@ static void h_glProgramStringARB(CPU *c)
         src[ARG(2)] = 0;
     }
 #ifdef LB_IOS
-    src = arb_matrix_rows(arb_inline_constants(arb_lower_nv(src)));   // gl4es knows ARB only (arb_lower.c)
+    src = arb_address_offsets(arb_matrix_rows(arb_inline_constants(arb_lower_nv(src))));   // gl4es knows ARB only (arb_lower.c)
+    src = arb_shadow_lookups(src);
     if (arb_fog_env(src)) fog_env_update();
 #else
     if (!host_has_nv_options()) src = arb_lower_nv(src);
 #endif
-    if (getenv("LB_SHADER_DUMP")) {   // before the host sees it, in case it crashes on it
+    if (af_debug_env("LB_SHADER_DUMP")) {   // before the host sees it, in case it crashes on it
         static int seq;
         char path[64];
         snprintf(path, sizeof path, "arbprog_%03d.txt", seq++);
@@ -1407,58 +1528,236 @@ static void rect_target(CPU *c, const char *name)
 }
 static void h_glUseProgram(CPU *c) { rect_use(c, "glUseProgram"); }
 static void h_glUseProgramObjectARB(CPU *c) { rect_use(c, "glUseProgramObjectARB"); }
-static void h_glBindTexture(CPU *c) { rect_target(c, "glBindTexture"); }
-// Depth+stencil textures (OutRun 2 SP's render targets), which gl4es cannot
-// make: the texture's size is kept, and attaching it to a framebuffer
-// attaches a DEPTH24_STENCIL8 renderbuffer of that size instead
-#define MAX_DS 64
-static struct { GLuint tex, rb; int w, h; } ds[MAX_DS];
-static int ds_find(GLuint tex)
-{
-    for (int i = 0; i < MAX_DS; i++)
-        if (ds[i].tex == tex && tex) return i;
-    return -1;
-}
-static void h_glTexImage2D(CPU *c)
-{
-    uint32_t internal = ARG(2), format = ARG(6);
-    if (ARG(0) == GL_TEXTURE_2D && (internal == 0x84F9 || internal == 0x88F0 || format == 0x84F9)) {   // DEPTH_STENCIL
-        GLint bound = 0;
-        glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
-        int i = ds_find((GLuint)bound);
-        for (int k = 0; k < MAX_DS && i < 0; k++)
-            if (!ds[k].tex) i = k;
-        if (i >= 0 && bound) {
-            if (ds[i].tex != (GLuint)bound) ds[i].rb = 0;
-            ds[i].tex = (GLuint)bound;
-            ds[i].w = (int)ARG(3), ds[i].h = (int)ARG(4);
-        }
-        RET(0);
-    }
-    rect_target(c, "glTexImage2D");
-}
+// Depth+stencil textures (OutRun 2 SP's render targets and its car's shadow
+// map) are gl4es's own, which on OpenGL ES 3 makes them DEPTH24_STENCIL8
+// (host_core_ios.m sizes the format). They were once kept out of gl4es and
+// attached as stand-in renderbuffers, which left the shadow map with no
+// image to sample: the car was drawn all in shadow (#78).
+static void h_glTexImage2D(CPU *c) { rect_target(c, "glTexImage2D"); }
+// The game attaches a depth+stencil texture to the depth attachment and then
+// to the stencil attachment; gl4es's stencil path remakes the texture as a
+// stencil one, which OpenGL ES 3 refuses (GL_INVALID_ENUM, the framebuffer
+// incomplete and the frame black). The second is made one DEPTH_STENCIL
+// attachment of it, which gl4es does.
 static void framebuffer_texture(CPU *c, const char *name)
 {
-    int i = ARG(2) == GL_TEXTURE_2D ? ds_find(ARG(3)) : -1;
-    if (i < 0) {
-        rect_call(c, name);
-        return;
-    }
-    if (!ds[i].rb) {
-        glGenRenderbuffersEXT(1, &ds[i].rb);
-        GLint prev = 0;
-        glGetIntegerv(GL_RENDERBUFFER_BINDING_EXT, &prev);
-        glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, ds[i].rb);
-        glRenderbufferStorageEXT(GL_RENDERBUFFER_EXT, GL_DEPTH24_STENCIL8_EXT, ds[i].w, ds[i].h);
-        glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, (GLuint)prev);
-    }
-    glFramebufferRenderbufferEXT(ARG(0), ARG(1), GL_RENDERBUFFER_EXT, ds[i].rb);
-    RET(0);
+    static uint32_t depth_tex;
+    uint32_t att = ARG(1), tex = ARG(3);
+    if (att == GL_DEPTH_ATTACHMENT_EXT) depth_tex = tex;
+    if (att == GL_STENCIL_ATTACHMENT_EXT && tex && tex == depth_tex) wr32(c->r[ESP] + 8, 0x821A);   // DEPTH_STENCIL_ATTACHMENT
+    rect_call(c, name);
 }
 static void h_glFramebufferTexture2DEXT(CPU *c) { framebuffer_texture(c, "glFramebufferTexture2DEXT"); }
 static void h_glFramebufferTexture2D(CPU *c) { framebuffer_texture(c, "glFramebufferTexture2D"); }
+
+// Shadow textures (#78): a texture whose compare mode is on is sampled with
+// no compare (OpenGL ES 3 compares only through a shadow sampler, and gl4es
+// writes 2D lookups as texture2D), and the fragment programs make the
+// comparison themselves (arb_lower.c, arb_shadow_lookups) from program
+// environment parameter 18 + unit, which the runtime keeps for units 0-3:
+// x 1 while a compare-mode texture is bound there, y its border depth, z and
+// w 1 where its s and t wrap is CLAMP_TO_BORDER (which gl4es makes
+// CLAMP_TO_EDGE: past OutRun 2 SP's shadow map the edge's depths were
+// compared, and the scenery right of it was lit unlike the rest).
+#define SHADOW_ENV 18
+typedef struct { GLuint tex; int compare, border_s, border_t; GLfloat border; } shadow_info;
+static shadow_info *shadow_tex;   // the textures given a compare mode, border wrap or colour
+static int shadow_n, shadow_cap;
+static GLuint unit_tex[4];        // the 2D texture bound on units 0-3
+static int active_unit;
+static shadow_info *shadow_get(GLuint t, int make)
+{
+    for (int i = 0; i < shadow_n; i++)
+        if (shadow_tex[i].tex == t) return &shadow_tex[i];
+    if (!make || !t) return NULL;
+    if (shadow_n == shadow_cap) shadow_tex = realloc(shadow_tex, sizeof(shadow_info) * (size_t)(shadow_cap = shadow_cap ? shadow_cap * 2 : 16));
+    shadow_tex[shadow_n] = (shadow_info){t, 0, 0, 0, 0};
+    return &shadow_tex[shadow_n++];
+}
+static shadow_info *shadow_bound(int make)
+{
+    return active_unit < 4 ? shadow_get(unit_tex[active_unit], make) : NULL;
+}
+static void shadow_env_update(void)
+{
+    typedef void (APIENTRY *envfn)(GLenum, GLuint, GLfloat, GLfloat, GLfloat, GLfloat);
+    static envfn env;
+    static GLfloat set[4][4] = {{-1}, {-1}, {-1}, {-1}};
+    if (!env) env = (envfn)gl_host_proc("glProgramEnvParameter4fARB");
+    for (int u = 0; u < 4 && env; u++) {
+        shadow_info *i = shadow_get(unit_tex[u], 0);
+        GLfloat v[4] = {0, 0, 0, 0};
+        if (i && i->compare) v[0] = 1, v[1] = i->border, v[2] = (GLfloat)i->border_s, v[3] = (GLfloat)i->border_t;
+        if (memcmp(v, set[u], sizeof v)) env(GL_FRAGMENT_PROGRAM_ARB, SHADOW_ENV + u, v[0], v[1], v[2], v[3]), memcpy(set[u], v, sizeof v);
+    }
+}
+static void h_glBindTexture(CPU *c)
+{
+    if (ARG(0) == GL_TEXTURE_2D && active_unit < 4) {
+        unit_tex[active_unit] = ARG(1);
+        shadow_env_update();
+    }
+    rect_target(c, "glBindTexture");
+}
+static void active_texture(CPU *c, const char *name)
+{
+    active_unit = (int)(ARG(0) - GL_TEXTURE0);
+    rect_call(c, name);
+}
+static void h_glActiveTexture(CPU *c) { active_texture(c, "glActiveTexture"); }
+static void h_glActiveTextureARB(CPU *c) { active_texture(c, "glActiveTextureARB"); }
+// compare mode and function, and the depth texture mode (which OpenGL ES has
+// not); a shadow texture filters NEAREST, as OpenGL ES 3 samples a depth
+// texture with no compare only so (a LINEAR one is incomplete and reads 0:
+// all in shadow). NVIDIA's linear filter averaged four comparisons. The wrap
+// and the border colour are kept (and passed on).
+static void shadow_filters(void)
+{
+    typedef void (APIENTRY *parfn)(GLenum, GLenum, GLint);
+    static parfn par;
+    if (!par) par = (parfn)gl_host_proc("glTexParameteri");
+    par(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    par(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+}
+static int shadow_param(CPU *c, uint32_t value, float border)
+{
+    uint32_t pname = ARG(1);
+    if (ARG(0) != GL_TEXTURE_2D) return 0;
+    shadow_info *i = shadow_bound(0);
+    if ((pname == GL_TEXTURE_MIN_FILTER || pname == GL_TEXTURE_MAG_FILTER) && i && i->compare) {
+        shadow_filters();
+        c->r[EAX] = 0;
+        return 1;
+    }
+    if (pname == GL_TEXTURE_WRAP_S || pname == GL_TEXTURE_WRAP_T || pname == 0x1004) {   // BORDER_COLOR
+        if ((i = shadow_bound(value == 0x812D || pname == 0x1004))) {   // CLAMP_TO_BORDER
+            if (pname == GL_TEXTURE_WRAP_S) i->border_s = value == 0x812D;
+            else if (pname == GL_TEXTURE_WRAP_T) i->border_t = value == 0x812D;
+            else i->border = border;
+            shadow_env_update();
+        }
+        return 0;
+    }
+    if (pname != 0x884C && pname != 0x884D && pname != 0x884B) return 0;   // COMPARE_MODE, _FUNC, DEPTH_TEXTURE_MODE
+    if (pname == 0x884C && (i = shadow_bound(1))) {
+        int on = value == 0x884E;   // COMPARE_R_TO_TEXTURE
+        if (on && !i->compare) shadow_filters();
+        i->compare = on;
+        shadow_env_update();
+    }
+    c->r[EAX] = 0;
+    return 1;
+}
+static void h_glTexParameteri(CPU *c) { if (!shadow_param(c, ARG(2), 0)) rect_call(c, "glTexParameteri"); }
+static void h_glTexParameterf(CPU *c) { if (!shadow_param(c, (uint32_t)ARGF(2), 0)) rect_call(c, "glTexParameterf"); }
+static void h_glTexParameteriv(CPU *c)
+{
+    if (!shadow_param(c, rd32(ARG(2)), (float)(int32_t)rd32(ARG(2)) / 2147483647.0f)) rect_call(c, "glTexParameteriv");
+}
+static void h_glTexParameterfv(CPU *c)
+{
+    float v;
+    uint32_t bits = rd32(ARG(2));
+    memcpy(&v, &bits, 4);
+    if (!shadow_param(c, (uint32_t)v, v)) rect_call(c, "glTexParameterfv");
+}
+// a deleted texture's name, reused, is no shadow texture (and unbound)
+static void h_glDeleteTextures(CPU *c)
+{
+    for (uint32_t k = 0; k < ARG(0); k++) {
+        GLuint t = rd32(ARG(1) + 4 * k);
+        shadow_info *i = shadow_get(t, 0);
+        if (i) *i = shadow_tex[--shadow_n];
+        for (int u = 0; u < 4; u++)
+            if (unit_tex[u] == t) unit_tex[u] = 0;
+    }
+    shadow_env_update();
+    rect_call(c, "glDeleteTextures");
+}
 static void h_glCopyTexImage2D(CPU *c) { rect_target(c, "glCopyTexImage2D"); }
 #endif
+
+// NVIDIA aliases the conventional arrays onto generic attributes (normal 2,
+// colour 3 and 4, texcoord n 8+n), and the vertex programs read those
+// (alias_vertex_inputs). Sega Race TV feeds its arrays the conventional way
+// (glTexCoordPointer...): on Apple's GL and Mesa its scenery's lightmap
+// coordinates (texcoord 1, attribute 9) read as 0, and the scenery was drawn
+// black. Each conventional array is set as its generic attribute too.
+static GLenum client_unit = GL_TEXTURE0;
+typedef void (APIENTRY *attrib_ptr_fn)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void *);
+typedef void (APIENTRY *attrib_on_fn)(GLuint);
+// what each generic attribute was last set to, so a call that changes
+// nothing is not made (HotD4 sets its arrays thousands of times a frame:
+// on Linux the copies cost 3-5 ms a frame)
+static struct { GLint size; GLenum type; GLboolean norm; GLsizei stride; const void *ptr; GLuint buffer; int on; } mirrored[16];
+static void mirror_pointer(GLuint index, GLint size, GLenum type, GLboolean norm, GLsizei stride, uint32_t ptr)
+{
+    static attrib_ptr_fn p;
+    if (!p) p = (attrib_ptr_fn)gl_host_proc("glVertexAttribPointerARB");
+    const void *a = gl_array_ptr(ptr);
+    if (index < 16 && mirrored[index].ptr == a && mirrored[index].size == size && mirrored[index].type == type &&
+        mirrored[index].norm == norm && mirrored[index].stride == stride && mirrored[index].buffer == array_buffer)
+        return;
+    if (index < 16) {
+        mirrored[index].size = size, mirrored[index].type = type, mirrored[index].norm = norm;
+        mirrored[index].stride = stride, mirrored[index].ptr = a, mirrored[index].buffer = array_buffer;
+    }
+    if (p) p(index, size, type, norm, stride, a);
+}
+static void mirror_array(GLenum array, int on)
+{
+    static attrib_on_fn en, dis;
+    if (!en) {
+        en = (attrib_on_fn)gl_host_proc("glEnableVertexAttribArrayARB");
+        dis = (attrib_on_fn)gl_host_proc("glDisableVertexAttribArrayARB");
+    }
+    GLuint index = array == GL_NORMAL_ARRAY ? 2 : array == GL_COLOR_ARRAY ? 3 : array == GL_SECONDARY_COLOR_ARRAY ? 4
+                 : array == GL_TEXTURE_COORD_ARRAY && client_unit - GL_TEXTURE0 < 8 ? 8 + client_unit - GL_TEXTURE0 : 0;
+    if (!index || !en || !dis || mirrored[index].on == on + 1) return;
+    mirrored[index].on = on + 1;
+    (on ? en : dis)(index);
+}
+// the generated wrapper of a GL call, found once (*cache)
+static void gen_call_cached(CPU *c, const char *name, hle_fn *cache)
+{
+    if (!*cache)
+        for (const hle_entry *e = gl_gen_table; e->name && !*cache; e++)
+            if (!strcmp(e->name, name)) *cache = e->fn;
+    if (*cache) (*cache)(c);
+}
+#define gen_call(c, name) do { static hle_fn fn_; gen_call_cached(c, name, &fn_); } while (0)
+static void h_glClientActiveTexture(CPU *c) { client_unit = ARG(0); gen_call(c, "glClientActiveTexture"); }
+static void h_glClientActiveTextureARB(CPU *c) { client_unit = ARG(0); gen_call(c, "glClientActiveTextureARB"); }
+static void h_glTexCoordPointer(CPU *c)
+{
+    if (client_unit - GL_TEXTURE0 < 8) mirror_pointer(8 + client_unit - GL_TEXTURE0, (GLint)ARG(0), ARG(1), GL_FALSE, (GLsizei)ARG(2), ARG(3));
+    gen_call(c, "glTexCoordPointer");
+}
+static void h_glNormalPointer(CPU *c)
+{
+    mirror_pointer(2, 3, ARG(0), ARG(0) != GL_FLOAT && ARG(0) != GL_DOUBLE, (GLsizei)ARG(1), ARG(2));
+    gen_call(c, "glNormalPointer");
+}
+static void h_glColorPointer(CPU *c)
+{
+    mirror_pointer(3, (GLint)ARG(0), ARG(1), ARG(1) != GL_FLOAT && ARG(1) != GL_DOUBLE, (GLsizei)ARG(2), ARG(3));
+    gen_call(c, "glColorPointer");
+}
+// the game setting a generic attribute itself: the mirror's record of it no longer holds
+static void forget(uint32_t index)
+{
+    if (index >= 16) return;
+    mirrored[index].ptr = (const void *)~(uintptr_t)0;
+    mirrored[index].on = 0;
+}
+static void h_glVertexAttribPointerARB(CPU *c) { forget(ARG(0)); gen_call(c, "glVertexAttribPointerARB"); }
+static void h_glVertexAttribPointer(CPU *c) { forget(ARG(0)); gen_call(c, "glVertexAttribPointer"); }
+static void h_glEnableVertexAttribArrayARB(CPU *c) { forget(ARG(0)); gen_call(c, "glEnableVertexAttribArrayARB"); }
+static void h_glEnableVertexAttribArray(CPU *c) { forget(ARG(0)); gen_call(c, "glEnableVertexAttribArray"); }
+static void h_glDisableVertexAttribArrayARB(CPU *c) { forget(ARG(0)); gen_call(c, "glDisableVertexAttribArrayARB"); }
+static void h_glDisableVertexAttribArray(CPU *c) { forget(ARG(0)); gen_call(c, "glDisableVertexAttribArray"); }
+static void h_glEnableClientState(CPU *c) { mirror_array(ARG(0), 1); gen_call(c, "glEnableClientState"); }
+static void h_glDisableClientState(CPU *c) { mirror_array(ARG(0), 0); gen_call(c, "glDisableClientState"); }
 
 static void h_glEnable(CPU *c), h_glDisable(CPU *c), h_glIsEnabled(CPU *c);
 static void h_glLoadProgramNV(CPU *c), h_glTrackMatrixNV(CPU *c), h_glBindProgramNV(CPU *c), h_glGenProgramsNV(CPU *c),
@@ -1472,6 +1771,12 @@ static const hle_entry gfx_special[] = {
     {"glProgramParameters4fvNV", h_glProgramParameters4fvNV},
     {"glMultiDrawElements", h_glMultiDrawElements}, {"glMultiDrawElementsEXT", h_glMultiDrawElements},
     {"glMultiDrawArrays", h_glMultiDrawArrays}, {"glMultiDrawArraysEXT", h_glMultiDrawArrays},
+    {"glClientActiveTexture", h_glClientActiveTexture}, {"glClientActiveTextureARB", h_glClientActiveTextureARB},
+    {"glTexCoordPointer", h_glTexCoordPointer}, {"glNormalPointer", h_glNormalPointer}, {"glColorPointer", h_glColorPointer},
+    {"glEnableClientState", h_glEnableClientState}, {"glDisableClientState", h_glDisableClientState},
+    {"glVertexAttribPointerARB", h_glVertexAttribPointerARB}, {"glVertexAttribPointer", h_glVertexAttribPointer},
+    {"glEnableVertexAttribArrayARB", h_glEnableVertexAttribArrayARB}, {"glEnableVertexAttribArray", h_glEnableVertexAttribArray},
+    {"glDisableVertexAttribArrayARB", h_glDisableVertexAttribArrayARB}, {"glDisableVertexAttribArray", h_glDisableVertexAttribArray},
     {"glGetString", h_glGetString}, {"glBindBuffer", h_glBindBuffer}, {"glBindBufferARB", h_glBindBufferARB},
     {"glShaderSource", h_glShaderSource}, {"glShaderSourceARB", h_glShaderSourceARB},
     {"glCompileShader", h_glCompileShader}, {"glCompileShaderARB", h_glCompileShaderARB},
@@ -1487,6 +1792,10 @@ static const hle_entry gfx_special[] = {
 #ifdef LB_IOS
     {"glUseProgram", h_glUseProgram}, {"glUseProgramObjectARB", h_glUseProgramObjectARB},
     {"glBindTexture", h_glBindTexture}, {"glTexImage2D", h_glTexImage2D},
+    {"glActiveTexture", h_glActiveTexture}, {"glActiveTextureARB", h_glActiveTextureARB},
+    {"glTexParameteri", h_glTexParameteri}, {"glTexParameterf", h_glTexParameterf},
+    {"glTexParameteriv", h_glTexParameteriv}, {"glTexParameterfv", h_glTexParameterfv},
+    {"glDeleteTextures", h_glDeleteTextures},
     {"glFramebufferTexture2DEXT", h_glFramebufferTexture2DEXT}, {"glFramebufferTexture2D", h_glFramebufferTexture2D},
     {"glCopyTexImage2D", h_glCopyTexImage2D},
     {"glFogf", h_glFogf}, {"glFogfv", h_glFogfv}, {"glFogi", h_glFogi}, {"glFogiv", h_glFogiv},
@@ -1582,7 +1891,7 @@ static void nv_load(GLenum target, unsigned id, const char *src, size_t len)
 {
     char *arb = nvvp_to_arb(src, len, nv_track);
 #ifdef LB_IOS
-    arb = arb_matrix_rows(arb_inline_constants(arb_lower_nv(arb)));   // gl4es knows ARB only (arb_lower.c)
+    arb = arb_address_offsets(arb_matrix_rows(arb_inline_constants(arb_lower_nv(arb))));   // gl4es knows ARB only (arb_lower.c)
     if (arb_fog_env(arb)) fog_env_update();
 #else
     if (!host_has_nv_options()) arb = arb_lower_nv(arb);
@@ -1610,7 +1919,7 @@ static void nv_load(GLenum target, unsigned id, const char *src, size_t len)
         FILE *f = fopen(path, "w");
         if (f) { fputs(arb, f); fclose(f); }
     }
-    if (getenv("LB_SHADER_DUMP")) {
+    if (af_debug_env("LB_SHADER_DUMP")) {
         char path[64];
         snprintf(path, sizeof path, "nvprog_%03u.txt", id);
         FILE *f = fopen(path, "w");
@@ -1781,10 +2090,10 @@ static void gl_check(const char *name)
 
 void hle_gfx_init(void)
 {
-    if (getenv("LB_GL_CHECK")) gl_check_hook = gl_check;
-    const char *s = getenv("LB_SHOT_EVERY");
+    if (af_debug_env("LB_GL_CHECK")) gl_check_hook = gl_check;
+    const char *s = af_debug_env("LB_SHOT_EVERY");
     if (s) shot_every = atoi(s);
-    s = getenv("LB_GL_TRACE");
+    s = af_debug_env("LB_GL_TRACE");
     if (s) {
         // N, or N-M for a range of frames
         trace_frame = trace_last = atoi(s);

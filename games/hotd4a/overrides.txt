@@ -7,3 +7,5 @@ amDipswExit
 amDipswGetData
 amDipswSetLed
 XF86VidModeSwitchToMode
+# CRI Sofdec's inverse DCT, natively (runtime/sofdec_idct.h, #49)
+DCT_IsseTrans

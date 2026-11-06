@@ -9,3 +9,7 @@ amDipswInit
 amDipswExit
 amDipswGetData
 amDipswSetLed
+# its region, from the EEPROM's system data (Japan when new): Export, in English
+_ZN11CGameAssign13GetGameRegionEv
+# CRI Sofdec's inverse DCT, natively (runtime/sofdec_idct.h, #49)
+DCT_IsseTrans

@@ -11,6 +11,7 @@
 //   button P up|down|left|right|b1|b2|b3|b4|BIT on|off   hold a player switch (gear shift, view;
 //                                             BIT 1-15, as in press)
 //   press P BIT                               press switch bit BIT (0-15) for 6 frames
+#include "af_debug.h"
 #include "input.h"
 #include "hle.h"
 #include "host.h"
@@ -29,7 +30,7 @@ static uint16_t held[2], was_held[2];         // switches the script holds down
 static void load_script(void)
 {
     script_loaded = 1;
-    const char *path = getenv("LB_INPUT_SCRIPT");
+    const char *path = af_debug_env("LB_INPUT_SCRIPT");
     FILE *f = path ? fopen(path, "r") : NULL;
     if (!f) return;
     char line[256];

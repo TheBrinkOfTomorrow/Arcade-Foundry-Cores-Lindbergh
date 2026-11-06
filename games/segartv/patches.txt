@@ -1,1 +1,4 @@
 # symbol+offset bytes, applied to the code before translation
+# amJvsInit (AM library, every Lindbergh game) sleeps a second before it
+# looks for the I/O board, at each start: the emulated board is there at once
+amJvsInit+133 00

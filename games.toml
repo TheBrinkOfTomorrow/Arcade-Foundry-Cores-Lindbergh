@@ -1,0 +1,44 @@
+# The games this core builds, one [[game]] per MAME ROM set. scripts/gen_games.py
+# writes the files that list them from this one (CI checks they match), and the
+# app's scripts/gen_games.py reads it for the app's catalog. The keys are in
+# common/tools/games/afgames.py (CORE_KEYS, BOARDS, CONTROLS).
+
+[[game]]
+set = "hotd4a"
+title = "The House of the Dead 4"
+year = 2005
+board = "lindbergh"
+version = "Revision A"
+core_version = "1.0.0"
+controls = "gun"
+gun_button = true
+renamed_from = ["hotd4"]
+build = { program = "disk0/elf/hod4M.elf", test_program = "disk0/elf/hod4testM.elf" }
+
+[[game]]
+set = "letsgoju"
+title = "Let's Go Jungle!"
+year = 2006
+board = "lindbergh"
+version = "Lost on the Island of Spice"
+core_version = "1.0.0"
+controls = "gun"
+renamed_from = ["lgj"]
+build = { program = "disk0/lgj_final" }
+
+[[game]]
+set = "segartv"
+title = "Sega Race TV"
+year = 2008
+board = "lindbergh"
+core_version = "1.1.0"
+build = { program = "disk0/drive.elf" }
+
+[[game]]
+set = "outr2sdx"
+title = "OutRun 2 SP SDX"
+year = 2006
+board = "lindbergh"
+core_version = "1.0.0"
+renamed_from = ["or2sp"]
+build = { program = "disk0/Jennifer/Jennifer", test_program = "disk0/JenTest/JenTest" }

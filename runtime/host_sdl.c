@@ -2,6 +2,7 @@
 // mouse as the cabinet's controls, and an SDL audio device pulling the mixer.
 // Controls: mouse = player 1 gun, left button trigger, right button reload,
 // 1/2 start, 5/6 coin, F2 test, F1 service.
+#include "af_debug.h"
 #include "host.h"
 #include "hle.h"
 #include "input.h"
@@ -108,7 +109,7 @@ static void callback(void *u, Uint8 *stream, int len)
 
 int host_audio_open(int rate)
 {
-    if (getenv("LB_FRAME_CLOCK")) return 0;
+    if (af_debug_env("LB_FRAME_CLOCK")) return 0;
     if (SDL_InitSubSystem(SDL_INIT_AUDIO)) {
         // no sound hardware: the dummy driver still runs the mixer in real time
         SDL_SetHint(SDL_HINT_AUDIODRIVER, "dummy");

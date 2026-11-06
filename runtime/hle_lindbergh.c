@@ -1,6 +1,7 @@
 // The Lindbergh cabinet: baseboard (shared memory, SRAM, JVS bus), EEPROM,
 // security and DIP-switch functions and libkswapapi. Audio is in hle_audio.c.
 // Written from the public JVS protocol and observed driver behaviour.
+#include "af_debug.h"
 #include "hle.h"
 #include "host.h"
 #include "input.h"
@@ -298,9 +299,55 @@ static const device_ops lbb_dev = {"/dev/lbb", lbb_open, lbb_ioctl, lbb_read, lb
 // ---- EEPROM on the SMBus: /dev/i2c/0 --------------------------------------------------
 static FILE *eeprom;
 
+#ifdef LB_REGION
+// amLib's static system data opens the EEPROM (amSysDataRecord_Static: 32
+// bytes at 0, a copy at 0x200), its CRC first: byte 14 is the cabinet's
+// region, 0 Japan, 1 USA, 2 Export, which the games read through amLib (HotD4's
+// CConfigMgr::GetRegion, OutRun 2 SP's asgGetCountryCode) and their test menus
+// show. A new EEPROM has none and reads as Japan: the runtime writes the region
+// the front end chose (lb_region) whenever the game opens it
+extern int lb_region;
+
+// amCrc32RGet: reflected CRC-32 from ~0, not inverted at the end
+static uint32_t am_crc32(const uint8_t *p, size_t n)
+{
+    uint32_t crc = 0xffffffff;
+    while (n--) {
+        crc ^= *p++;
+        for (int i = 0; i < 8; i++) crc = crc >> 1 ^ (crc & 1 ? 0xedb88320 : 0);
+    }
+    return crc;
+}
+
+static void eeprom_set_region(void)
+{
+    static const uint8_t region[3] = {2, 1, 0};
+    for (long at = 0; at <= 0x200; at += 0x200) {
+        uint8_t r[32];
+        fseek(eeprom, at, SEEK_SET);
+        if (fread(r, 1, sizeof r, eeprom) != sizeof r) continue;
+        uint32_t crc = r[0] | r[1] << 8 | r[2] << 16 | (uint32_t)r[3] << 24;
+        if (crc != am_crc32(r + 4, 28)) {   // none yet: amSysData_InitStatic's
+            memset(r, 0, sizeof r);
+            memcpy(r + 15, "AAGX-01A00009999", 16);
+        } else if (r[14] == region[lb_region]) continue;
+        r[14] = region[lb_region];
+        crc = am_crc32(r + 4, 28);
+        for (int i = 0; i < 4; i++) r[i] = (uint8_t)(crc >> 8 * i);
+        fseek(eeprom, at, SEEK_SET);
+        fwrite(r, 1, sizeof r, eeprom);
+    }
+    fflush(eeprom);
+    fseek(eeprom, 0, SEEK_SET);
+}
+#endif
+
 static int i2c_open(void)
 {
     if (!eeprom) eeprom = open_save("eeprom.bin", 8192);
+#ifdef LB_REGION
+    if (eeprom) eeprom_set_region();
+#endif
     return 0;
 }
 
@@ -571,6 +618,42 @@ void ovr_XF86VidModeSwitchToMode(CPU *c) { RET(0); }
 
 // Sega Race TV's own gettid makes the system call (int 0x80)
 void ovr_gettid(CPU *c) { RET(1000); }
+// The region the front end chose (afcore set_option "region", the core's
+// options): 0 Export, 1 USA, 2 Japan. The games keep theirs in the system
+// data of their EEPROM, which the runtime writes (eeprom_set_region); Race
+// TV and Let's Go Jungle are also answered directly.
+int lb_region;
+// Sega Race TV (CGameAssign::GetGameRegion): 0 Japan, 1 USA, 2 Export; the
+// language follows (English but in Japan)
+void ovr__ZN11CGameAssign13GetGameRegionEv(CPU *c)
+{
+    static const int region[3] = {2, 1, 0};
+    RET(region[lb_region]);
+}
+// Let's Go Jungle (acpSystem::getRegion): 1 Japan, 2 USA, 3 Export ("Lost on
+// the Island of Spice")
+void ovr__ZN9acpSystem9getRegionEv(CPU *c)
+{
+    static const int region[3] = {3, 2, 1};
+    RET(region[lb_region]);
+}
+
+// CRI Sofdec's 8x8 inverse DCT (DCT_IsseTrans: src, dst, full), natively
+// and to the bit (sofdec_idct.h): the game's MMX one, translated, was a large
+// share of a frame while a movie plays (#49). Its tables' addresses in this
+// game: games/<game>/game.cmake's GAME_SOFDEC_IDCT.
+#ifdef LB_SOFDEC_IDCT
+#include "sofdec_idct.h"
+void ovr_DCT_IsseTrans(CPU *c)
+{
+    static const uint32_t at[12] = {LB_SOFDEC_IDCT};
+    static const int16_t *t[12];
+    if (!t[0])
+        for (int i = 0; i < 12; i++) t[i] = (const int16_t *)G(at[i]);
+    sofdec_idct((const int16_t *)G(ARG(0)), (int16_t *)G(ARG(1)), ARG(2) != 0, t);
+    RET(0);
+}
+#endif
 
 // The keychip's user data (64 bytes); Let's Go Jungle reads it at boot and
 // stops with "Error 15, Game Program Not Found." unless it starts with its
@@ -653,7 +736,7 @@ static const hle_entry lindbergh_table[] = {
 
 void hle_lindbergh_init(void)
 {
-    const char *s = getenv("LB_SAVE_DIR");
+    const char *s = af_debug_env("LB_SAVE_DIR");
     if (save_root[0]) snprintf(save_dir, sizeof save_dir, "%s", save_root);
     else if (s) snprintf(save_dir, sizeof save_dir, "%s", s);
     else snprintf(save_dir, sizeof save_dir, "%s/save", game_root);
@@ -661,7 +744,7 @@ void hle_lindbergh_init(void)
     snprintf(tmp, sizeof tmp, "%s/tmp", save_root[0] ? save_root : game_root);
     mkdir(save_dir, 0755);
     mkdir(tmp, 0755);
-    const char *dip = getenv("LB_DIPSW");
+    const char *dip = af_debug_env("LB_DIPSW");
     if (dip) dip_bits = (uint8_t)strtoul(dip, NULL, 0);
 #ifdef LB_DRIVING
     jvs_in.analog[0] = 0x8000;   // the wheel at its centre (OutRun 2 SP homes the drive board on it)

@@ -1,6 +1,7 @@
 // Linux front end: runs one recompiled game from the directory of its ELF
 // (disk0/elf for HotD4, disk0 for Let's Go Jungle).
 // usage: lindbergh-run path/to/disk0/elf/game.elf [args...]
+#include "af_debug.h"
 #include "hle.h"
 #include <libgen.h>
 #include <limits.h>
@@ -44,7 +45,7 @@ int main(int argc, char **argv)
     // relative paths start here, as in the core: the game's chdir moves this,
     // not the process's directory (where screenshots and dumps go)
     snprintf(elf_dir, sizeof elf_dir, "%s", d);
-    hle_verbose = getenv("LB_VERBOSE") != NULL;
+    hle_verbose = af_debug_env("LB_VERBOSE") != NULL;
     run_game(&LB_PROGRAM, elf, argc - 1, argv + 1);
     return 0;
 }

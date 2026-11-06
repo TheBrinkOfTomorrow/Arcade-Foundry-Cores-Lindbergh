@@ -1,4 +1,5 @@
 // glibc 2.3, libm, libgcc and libstdc++.so.5 functions, on guest memory.
+#include "af_debug.h"
 #include "hle.h"
 #include "host.h"
 #include <ctype.h>
@@ -23,11 +24,30 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef LB_BOOT_TEXT
+// A game whose boot screen does its setup a step a frame formats this text
+// (games/<game>/game.cmake's GAME_BOOT_TEXT) on every frame of it: Race TV's
+// "INITIALIZE STEP", which took about 2000 frames, 35 s at 60 a second, though
+// a frame's work is about 6 ms (#57). Until it stops, frames don't wait:
+// host_present doesn't hold the game to the front end, and gettimeofday runs
+// BOOT_CLOCK times fast, so the game's own frame limiter lets each frame go as
+// soon as its work is done. Only while the frames are the limiter's (1/60 s
+// or less, and a margin): where a boot frame's work takes longer (the iPad, 100-350
+// ms), a fast clock only shortened the work the game fits in a frame, and the
+// boot took 676 s against 470 s without it (#70's follow-up).
+int lb_booting;      // frames left: 2 on each boot text, one less at each present
+int lb_boot_clock;   // the last frame was the limiter's, not its work's: the clock runs fast
+#define BOOT_CLOCK 4
+#endif
+
 // ---- formatted I/O ------------------------------------------------------------
 // Walk the guest format, take each argument from guest varargs at its i386
 // size, and format it with the host printf one conversion at a time.
 int guest_vformat(char *out, size_t n, const char *fmt, uint32_t ap)
 {
+#ifdef LB_BOOT_TEXT
+    if (fmt == (const char *)G(LB_BOOT_TEXT)) lb_booting = 2;
+#endif
     size_t o = 0;
     char spec[64], piece[4096];
 #define PUT(s, len) do { size_t _l = (len); for (size_t _i = 0; _i < _l; _i++) { if (o + 1 < n) out[o] = (s)[_i]; o++; } } while (0)
@@ -1136,6 +1156,18 @@ static void h_gettimeofday(CPU *c)
 {
     struct timeval tv;
     gettimeofday(&tv, NULL);
+#ifdef LB_BOOT_TEXT
+    // fast while booting; then at the real rate, ahead by what it gained
+    static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+    static int64_t last, ahead;
+    int64_t now = (int64_t)tv.tv_sec * 1000000 + tv.tv_usec;
+    pthread_mutex_lock(&m);
+    if (last && lb_booting && lb_boot_clock) ahead += (now - last) * (BOOT_CLOCK - 1);
+    last = now;
+    now += ahead;
+    pthread_mutex_unlock(&m);
+    tv.tv_sec = (time_t)(now / 1000000), tv.tv_usec = (suseconds_t)(now % 1000000);
+#endif
     if (ARG(0)) {
         wr32(ARG(0), (uint32_t)tv.tv_sec);
         wr32(ARG(0) + 4, (uint32_t)tv.tv_usec);
@@ -1157,8 +1189,15 @@ static void h_localtime(CPU *c)
     RET(tm_buf);
 }
 
-static void h_usleep(CPU *c) { guest_sleep_us(ARG(0)); RET(0); }
-static void h_sleep(CPU *c) { guest_sleep_us(ARG(0) * 1000000ull); RET(0); }
+// LB_SLEEPLOG: each guest sleep of 0.1 s or more, with who called it
+static void sleep_log(CPU *c, uint64_t us)
+{
+    static int on = -1;
+    if (on < 0) on = af_debug_env("LB_SLEEPLOG") != NULL;
+    if (on && us >= 100000) hle_log("sleep %.2f s from 0x%08x\n", us / 1e6, rd32(c->r[ESP]));
+}
+static void h_usleep(CPU *c) { sleep_log(c, ARG(0)); guest_sleep_us(ARG(0)); RET(0); }
+static void h_sleep(CPU *c) { sleep_log(c, ARG(0) * 1000000ull); guest_sleep_us(ARG(0) * 1000000ull); RET(0); }
 
 // ---- process --------------------------------------------------------------------------------
 // what the games' launch scripts on the cabinet's disk export

@@ -6,7 +6,8 @@
 
 // gl4es's limits (its src/config.h, which this replaces through its include
 // guard), with more program local parameters: Sega Race TV's precompiled
-// vertex programs use program.local up to 164, its fragment programs up to 49;
+// vertex programs use program.local up to 164 (Let's Go Jungle's, compiled by
+// Cg at run time, up to 233: its skinned models), its fragment programs up to 49;
 // and more vertex env parameters: OutRun 2 SP's NV vertex programs read c[]
 // up to 212 (NV_vertex_program2 has 256; gl4es kept 96 and dropped the rest)
 #define _GL4ES_MAIN_CONFIG_H
@@ -24,7 +25,7 @@
 #define MAX_MAP_SIZE 256
 #define MAX_ARB_MATRIX 8
 #define MAX_VTX_PROG_ENV_PARAMS 256
-#define MAX_VTX_PROG_LOC_PARAMS 192
+#define MAX_VTX_PROG_LOC_PARAMS 256
 #define MAX_FRG_PROG_ENV_PARAMS 24
 #define MAX_FRG_PROG_LOC_PARAMS 64
 #define MAX_DRAW_BUFFERS 16

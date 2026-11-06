@@ -17,3 +17,7 @@ amDipswGetData
 amDipswSetLed
 # The keychip user data, with the game ID from keychip.txt
 amDongleUserInfoEx
+# its region, from the EEPROM's system data (Japan when new): Export, in English
+_ZN9acpSystem9getRegionEv
+# CRI Sofdec's inverse DCT, natively (runtime/sofdec_idct.h, #49)
+DCT_IsseTrans

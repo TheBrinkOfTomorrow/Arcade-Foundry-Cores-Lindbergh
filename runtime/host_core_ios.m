@@ -3,6 +3,7 @@
 // The games' desktop OpenGL 2.x (immediate mode, fixed function, ARB programs,
 // GLSL 1.20) goes through gl4es, which turns it into OpenGL ES; the runtime calls
 // gl4es's functions by name (gl_host.h) and gl4es calls OpenGL ES.
+#include "af_debug.h"
 #include "host.h"
 #include "hle.h"
 #include "gl_host.h"
@@ -12,11 +13,38 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if defined(LB_MTLGLES)
+// our own OpenGL ES 3.0 subset on Metal (Cores-Common's lib/mtlgles)
+#include "mtlgles.h"
+#define ES_SYM(name) mtlgles_proc(name)
+static mtlgles_context *ctx;
+// whole: MTLGLES_DUMP's programs are longer than hle_log's line
+static void mtlgles_to_log(const char *m)
+{
+    if (strlen(m) < 900) hle_log("%s", m);
+    else fputs(m, stderr);
+}
+#else
 #import <OpenGLES/EAGL.h>
 #import <CoreVideo/CoreVideo.h>
-
+#define ES_SYM(name) dlsym(RTLD_DEFAULT, name)
 static EAGLContext *ctx;
+#endif
 static int win_w, win_h;
+
+// The frame's autoreleased Objective-C objects (Metal command buffers, encoders
+// and pass descriptors, mtlgles' cache keys, EAGL's own) are freed once a
+// frame. The guest threads that draw are plain pthreads with no pool, so the
+// runtime's implicit one would keep them until the thread ends: on mtlgles
+// HotD4 grew about 5 MB a frame on the M1 iPad until iOS ended it at 5 GB.
+void *objc_autoreleasePoolPush(void);
+void objc_autoreleasePoolPop(void *pool);
+static __thread void *frame_pool;
+void host_gl_frame_pool(void)
+{
+    if (frame_pool) objc_autoreleasePoolPop(frame_pool);
+    frame_pool = objc_autoreleasePoolPush();
+}
 static GLuint fbo, color_tex, depth_rb;
 static __thread int current;      // the context is current on this thread
 static int gl4es_ready;
@@ -28,15 +56,60 @@ void ActivateGLState(void *state);
 void DeleteGLState(void *state);
 static void *gl4es_state;
 
+// OpenGL ES 3 makes depth textures from sized formats only; gl4es asks for
+// the unsized ones of OES_depth_texture (an OpenGL ES 2 extension), which on
+// ES 3 give a texture no framebuffer takes (Let's Go Jungle's depth targets)
+static int es3;
+static void (*tex_image_2d)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *);
+static void sized_tex_image_2d(GLenum target, GLint level, GLint internal, GLsizei w, GLsizei h, GLint border,
+                               GLenum format, GLenum type, const void *data)
+{
+    if (es3 && internal == GL_DEPTH_COMPONENT && format == GL_DEPTH_COMPONENT)
+        internal = type == GL_UNSIGNED_SHORT ? GL_DEPTH_COMPONENT16 : type == GL_FLOAT ? 0x8CAC : GL_DEPTH_COMPONENT24;   // 32F
+    else if (es3 && internal == GL_DEPTH_STENCIL && format == GL_DEPTH_STENCIL)
+        internal = GL_DEPTH24_STENCIL8;
+    tex_image_2d(target, level, internal, w, h, border, format, type, data);
+}
+
 // gl4es asks for OpenGL ES's entry points by name: the system framework's
-static void *gles_proc(const char *name) { return dlsym(RTLD_DEFAULT, name); }
+static void *gles_proc(const char *name)
+{
+    void *p = ES_SYM(name);
+    if (p && !strcmp(name, "glTexImage2D")) {
+        tex_image_2d = p;
+        return (void *)sized_tex_image_2d;
+    }
+    return p;
+}
 static void main_fb_size(int *w, int *h) { *w = win_w, *h = win_h; }
 
 void *host_gl_proc(const char *name) { return gl4es_GetProcAddress(name); }
 
+#if defined(LB_MTLGLES)
+// gl4es calls these three by their OpenGL ES names (texgen.c, stencil.c); on
+// iOS the OpenGLES framework has them, here mtlgles does. The assembler names
+// keep gl4es_names.h's macros off them.
+#define ES_FWD(ret, name, params, args)                                                                          \
+    ret lb_es_##name params __asm__("_" #name);                                                                  \
+    ret lb_es_##name params                                                                                      \
+    {                                                                                                            \
+        static ret(*f) params;                                                                                   \
+        if (!f) *(void **)&f = ES_SYM(#name);                                                                    \
+        return f args;                                                                                           \
+    }
+ES_FWD(void, glGetFloatv, (GLenum pname, GLfloat *data), (pname, data))
+ES_FWD(void, glStencilFunc, (GLenum func, GLint ref, GLuint mask), (func, ref, mask))
+ES_FWD(void, glStencilOp, (GLenum fail, GLenum zfail, GLenum zpass), (fail, zfail, zpass))
+#undef ES_FWD
+#endif
+
 static void make_current(int on)
 {
+#if defined(LB_MTLGLES)
+    mtlgles_make_current(on ? ctx : NULL);
+#else
     [EAGLContext setCurrentContext:on ? ctx : nil];
+#endif
     current = on;
 }
 
@@ -47,9 +120,17 @@ void host_gl_open(int w, int h)
     // OpenGL ES 3 where there is one: more varyings than ES 2 (HotD4's skinned
     // shaders need them); gl4es takes ES 3's core packed depth and stencil as
     // there (cmake/gl4es_fixes.cmake)
+#if defined(LB_MTLGLES)
+    mtlgles_set_log(mtlgles_to_log);
+    ctx = mtlgles_create(NULL);
+    if (!ctx) host_fatal("no Metal device");
+    es3 = 1;
+#else
     ctx = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES3];
     if (!ctx) ctx = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES2];
     if (!ctx) host_fatal("cannot create an OpenGL ES context");
+    es3 = ctx.API == kEAGLRenderingAPIOpenGLES3;
+#endif
     make_current(1);
     if (!gl4es_ready) {
         set_getprocaddress(gles_proc);
@@ -156,21 +237,21 @@ enum {
 static void readback_setup(void)
 {
     rb.ready = 1;
-    rb.bind_fb = (es_bind_fn)dlsym(RTLD_DEFAULT, "glBindFramebuffer");
-    rb.bind_buf = (es_bind_fn)dlsym(RTLD_DEFAULT, "glBindBuffer");
-    rb.geti = (es_geti_fn)dlsym(RTLD_DEFAULT, "glGetIntegerv");
-    rb.read = (es_read_fn)dlsym(RTLD_DEFAULT, "glReadPixels");
-    rb.gen_buf = (es_genbuf_fn)dlsym(RTLD_DEFAULT, "glGenBuffers");
-    rb.buf_data = (es_bufdata_fn)dlsym(RTLD_DEFAULT, "glBufferData");
-    rb.map = (es_map_fn)dlsym(RTLD_DEFAULT, "glMapBufferRange");
-    rb.unmap = (es_unmap_fn)dlsym(RTLD_DEFAULT, "glUnmapBuffer");
-    rb.fence_sync = (es_fence_fn)dlsym(RTLD_DEFAULT, "glFenceSync");
-    rb.wait_sync = (es_wait_fn)dlsym(RTLD_DEFAULT, "glClientWaitSync");
-    rb.del_sync = (es_delsync_fn)dlsym(RTLD_DEFAULT, "glDeleteSync");
-    rb.del_buf = (es_delbuf_fn)dlsym(RTLD_DEFAULT, "glDeleteBuffers");
-    rb.pixelstore = (es_pixelstore_fn)dlsym(RTLD_DEFAULT, "glPixelStorei");
-    rb.flush = (es_flush_fn)dlsym(RTLD_DEFAULT, "glFlush");
-    rb.async = ctx.API == kEAGLRenderingAPIOpenGLES3 && rb.bind_fb && rb.bind_buf && rb.geti && rb.read &&
+    rb.bind_fb = (es_bind_fn)ES_SYM("glBindFramebuffer");
+    rb.bind_buf = (es_bind_fn)ES_SYM("glBindBuffer");
+    rb.geti = (es_geti_fn)ES_SYM("glGetIntegerv");
+    rb.read = (es_read_fn)ES_SYM("glReadPixels");
+    rb.gen_buf = (es_genbuf_fn)ES_SYM("glGenBuffers");
+    rb.buf_data = (es_bufdata_fn)ES_SYM("glBufferData");
+    rb.map = (es_map_fn)ES_SYM("glMapBufferRange");
+    rb.unmap = (es_unmap_fn)ES_SYM("glUnmapBuffer");
+    rb.fence_sync = (es_fence_fn)ES_SYM("glFenceSync");
+    rb.wait_sync = (es_wait_fn)ES_SYM("glClientWaitSync");
+    rb.del_sync = (es_delsync_fn)ES_SYM("glDeleteSync");
+    rb.del_buf = (es_delbuf_fn)ES_SYM("glDeleteBuffers");
+    rb.pixelstore = (es_pixelstore_fn)ES_SYM("glPixelStorei");
+    rb.flush = (es_flush_fn)ES_SYM("glFlush");
+    rb.async = es3 && !af_debug_env("LB_SYNC_READ") && rb.bind_fb && rb.bind_buf && rb.geti && rb.read &&
                rb.gen_buf && rb.buf_data && rb.map && rb.unmap && rb.fence_sync && rb.wait_sync && rb.del_sync;
     if (!rb.async) return;
     GLint prev_read = 0, fmt = 0, type = 0;
@@ -179,7 +260,7 @@ static void readback_setup(void)
     rb.geti(ES_IMPLEMENTATION_COLOR_READ_FORMAT, &fmt);
     rb.geti(ES_IMPLEMENTATION_COLOR_READ_TYPE, &type);
     rb.bind_fb(ES_READ_FRAMEBUFFER, (GLuint)prev_read);
-    rb.bgra = (fmt == ES_BGRA && type == GL_UNSIGNED_BYTE) || getenv("LB_READ_BGRA");   // the latter: to time it
+    rb.bgra = (fmt == ES_BGRA && type == GL_UNSIGNED_BYTE) || af_debug_env("LB_READ_BGRA");   // the latter: to time it
     rb.gen_buf(RING, rb.pbo);
     GLint prev_pack = 0;
     rb.geti(ES_PIXEL_PACK_BUFFER_BINDING, &prev_pack);
@@ -290,6 +371,7 @@ void host_gl_readback(uint32_t *dst)
     copy_frame(dst, tmp, 0);
 }
 
+#if !defined(LB_MTLGLES)
 // The finished frame for a front end that shows it with Metal (afcore
 // screen_surface): copied on the GPU, flipped top row first, into one of five
 // IOSurface-backed BGRA pixel buffers (CVOpenGLESTextureCache), with a fence;
@@ -331,15 +413,15 @@ static void surface_setup(void)
 {
     sf.ready = 1;
     if (!rb.ready) readback_setup();   // its entry points (fences, bindings)
-    sf.gen_fb = (es_genfb_fn)dlsym(RTLD_DEFAULT, "glGenFramebuffers");
-    sf.del_fb = (es_genfb_fn)dlsym(RTLD_DEFAULT, "glDeleteFramebuffers");
-    sf.fb_tex = (es_fbtex_fn)dlsym(RTLD_DEFAULT, "glFramebufferTexture2D");
-    sf.fb_status = (es_fbstatus_fn)dlsym(RTLD_DEFAULT, "glCheckFramebufferStatus");
-    sf.blit = (es_blit_fn)dlsym(RTLD_DEFAULT, "glBlitFramebuffer");
-    sf.is_enabled = (es_isenabled_fn)dlsym(RTLD_DEFAULT, "glIsEnabled");
-    sf.enable = (es_cap_fn)dlsym(RTLD_DEFAULT, "glEnable");
-    sf.disable = (es_cap_fn)dlsym(RTLD_DEFAULT, "glDisable");
-    sf.bind_tex = (es_bindtex_fn)dlsym(RTLD_DEFAULT, "glBindTexture");
+    sf.gen_fb = (es_genfb_fn)ES_SYM("glGenFramebuffers");
+    sf.del_fb = (es_genfb_fn)ES_SYM("glDeleteFramebuffers");
+    sf.fb_tex = (es_fbtex_fn)ES_SYM("glFramebufferTexture2D");
+    sf.fb_status = (es_fbstatus_fn)ES_SYM("glCheckFramebufferStatus");
+    sf.blit = (es_blit_fn)ES_SYM("glBlitFramebuffer");
+    sf.is_enabled = (es_isenabled_fn)ES_SYM("glIsEnabled");
+    sf.enable = (es_cap_fn)ES_SYM("glEnable");
+    sf.disable = (es_cap_fn)ES_SYM("glDisable");
+    sf.bind_tex = (es_bindtex_fn)ES_SYM("glBindTexture");
     if (!rb.async) hle_log("GL: no OpenGL ES 3 readback: no IOSurface buffers\n");
     if (!rb.async || !sf.gen_fb || !sf.del_fb || !sf.fb_tex || !sf.fb_status || !sf.blit || !sf.is_enabled ||
         !sf.enable || !sf.disable || !sf.bind_tex)
@@ -479,6 +561,15 @@ static void surface_close(void)
     memset(&sf, 0, sizeof sf);
 }
 
+#else
+// mtlgles: frames are read back (no IOSurface hand-over yet)
+static struct { int t_n; double t_blit, t_poll; } sf;
+int host_gl_surfaces(void) { return 0; }
+void *host_gl_surface_frame(void) { return NULL; }
+void host_gl_surface_read(void *surface, uint32_t *dst, int w, int h) { (void)surface, (void)dst, (void)w, (void)h; }
+static void surface_close(void) {}
+#endif
+
 // the GPU's time per frame (a read queued to its fence found done) and where
 // the readback's time went, for the perf: line; empty without asynchronous reads
 void host_gl_perf(char *buf, size_t size)
@@ -517,8 +608,14 @@ void host_gl_close(void)
         DeleteGLState(gl4es_state);
         gl4es_state = NULL;
     }
+#if defined(LB_MTLGLES)
+    mtlgles_make_current(NULL);
+    mtlgles_destroy(ctx);
+    ctx = NULL;
+#else
     if (ctx) [EAGLContext setCurrentContext:nil];
     ctx = nil;
+#endif
     current = 0;
     fbo = color_tex = depth_rb = 0;
     win_w = win_h = 0;

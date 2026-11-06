@@ -5,7 +5,7 @@ end. A Lindbergh cabinet is a Pentium 4 PC running Linux; each game is one
 32-bit x86 ELF that talks to OpenGL 2, X11, pthreads, libc and a handful of Sega
 devices. This project:
 
-1. **translates the game's x86 code to C** ahead of time (`tools/x86recomp`),
+1. **translates the game's x86 code to C** ahead of time (`common/tools/x86recomp`, shared with Chihiro),
    so it builds for ARM64 and runs where JIT is not allowed (iOS, tvOS);
 2. **replaces the libraries and hardware** the game uses with host code
    (`runtime/`): libc and the C++ runtime, pthreads, X11/GLX, an OpenGL bridge
@@ -29,8 +29,9 @@ build translates it on your machine.
 
 ## Building (Linux)
 
-Requirements: CMake 3.16+, a C compiler, SDL2, OpenGL, Python 3 with
-`capstone` and `pyelftools`.
+Requirements: CMake 3.16+, a C compiler, SDL2, OpenGL, Python 3.11+ with
+`capstone` and `pyelftools` (the shared venv: `common/tools/afic-venv/setup.sh`,
+see [The Python venv](#the-python-venv)).
 
 ```sh
 mkdir -p extern
@@ -45,29 +46,28 @@ cmake --build build -j
 
 ```sh
 brew install cmake sdl2 e2fsprogs p7zip
-python3 -m venv venv && venv/bin/pip install capstone pyelftools
-# then the same curl and cmake lines as above, adding
-#   -DPython3_EXECUTABLE=$PWD/venv/bin/python -DCMAKE_BUILD_TYPE=Release
+git submodule update --init
+common/tools/afic-venv/setup.sh      # the shared Python venv, ~/venvs/afic (once)
+# then the same curl and cmake lines as above, adding -DCMAKE_BUILD_TYPE=Release
 ```
 
 ### The Python venv
 
-The translator (`tools/x86recomp/recomp.py`) runs at build time and needs the
-Python packages `capstone` and `pyelftools`. Homebrew's Python refuses
-`pip install` into itself, so make a virtual environment once, in the root
-of this checkout and named `venv` (it is git-ignored):
+The translator (`common/tools/x86recomp/recomp.py`) runs at build time and needs the
+Python packages `capstone` and `pyelftools`. They come from the one shared
+venv every Arcade Foundry repo uses, `~/venvs/afic` (`AFIC_VENV` to put it
+elsewhere), never from the system's Python. Make it once per machine, and
+again when Cores-Common's `tools/afic-venv/requirements.txt` changes:
 
 ```sh
-python3 -m venv venv
-venv/bin/pip install capstone pyelftools
+common/tools/afic-venv/setup.sh
 ```
 
-Then pass `-DPython3_EXECUTABLE=$PWD/venv/bin/python` to CMake. When this
-repo is the Insert Coin app's submodule (`cores/arcade-foundry-cores-lindbergh`),
-make the venv inside the submodule folder: the app's `build_cores.py` uses
-`<this checkout>/venv/bin/python` when it exists and otherwise the Python it
-runs under. A build without them stops with
-`ModuleNotFoundError: No module named 'capstone'`.
+CMake uses it on its own when `-DPython3_EXECUTABLE` is not given and the
+build folder is new (a build folder configured before keeps the Python it
+found then). The app's `build_cores.py` uses it too. A `venv/` folder in this
+checkout from before is no longer used and can be deleted. A build without
+the packages stops with `ModuleNotFoundError: No module named 'capstone'`.
 
 The runtime uses the system OpenGL framework's legacy 2.1 profile (GLSL 1.20).
 A TeknoParrot-style dump (`hotd4.bin`, an ext2 image) unpacks without root:
@@ -85,7 +85,7 @@ needed to change the font.
 Add `-DLB_CORE=ON` (needs `GAME_TEST_ELF`) to also build `afcore_hotd4a`, the
 game as a core the Arcade Foundry: Insert Coin app loads: a shared library on Linux (EGL),
 a framework on macOS. It exports one function, `afcore_api_hotd4a`, with the
-interface in `include/afcore.h`. Its "ROM" is the game folder (the one that
+interface in `common/include/afcore.h`. Its "ROM" is the game folder (the one that
 holds `disk0/`). `core_test` drives it without a window:
 
 ```sh
@@ -99,6 +99,13 @@ where each script line is `<frame> coin|start|start2|test|service`,
 it runs at the core's frame rate, as the front end does (OutRun 2 SP times its
 loading by the clock); otherwise as fast as it can.
 
+The translated C is compiled at `-O1`; `-DLB_GEN_OPT=-O2` tries `-O2` for a
+game (a longer build; `core_test` prints the frames a second to compare).
+Measured on HotD4 (3600 frames of attract mode, 2026-11-03) it gained
+nothing: 51.9 against 52.3 fps on an Apple M6, 49.1 against 49.6 on a
+Ryzen 5600X with Mesa, inside run-to-run noise, for a build half again as
+long. The game's frame-rate manager and the GPU set the pace, not the CPU.
+
 ### iOS (iPadOS)
 
 The core builds for iOS as a framework (no `lindbergh-run`). The games'
@@ -109,7 +116,6 @@ fixed commit (see `THIRD_PARTY.md`). Use Ninja:
 cmake -S . -B build-ios -G Ninja -DCMAKE_SYSTEM_NAME=iOS \
   -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_ARCHITECTURES=arm64 \
   -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 -DCMAKE_BUILD_TYPE=Release \
-  -DPython3_EXECUTABLE=$PWD/venv/bin/python \
   -DGAME=hotd4a -DGAME_ELF=... -DGAME_TEST_ELF=...
 cmake --build build-ios -j
 ```
@@ -146,21 +152,23 @@ The game directory is the cabinet's `/home` (it holds `disk0/`). Saves go to
 Controls: mouse aims the player 1 gun, left button fires, right button
 reloads; `1`/`2` start, `5`/`6` coin, `F2` test, `F1` service.
 
-Environment variables:
+Environment variables (the cores' debug switches; every core's are listed in
+Arcade-Foundry-Cores-Common's `docs/DEBUG-SWITCHES.md`). The old names without
+`AF_DEBUG_` still work in 1.3.0 and go in 1.4.0:
 
 | Variable | Effect |
 |---|---|
-| `LB_VERBOSE=1` | Log file and device access. |
-| `LB_SHOT_EVERY=N` | Save a PPM of every Nth frame. |
-| `LB_GL_TRACE=N` or `N-M` | Log every GL and library call during frame N (or frames N to M). Frame 0 is everything before the first swap. |
-| `LB_GL_CHECK=1` | Check `glGetError` after every GL call and log the calls that raise errors. |
-| `LB_SHOT_FBO=N` | Screenshots read the game's framebuffer object N instead of the screen. |
-| `LB_SHADER_DUMP=1` | Write each shader, after the GLSL fixes, to `shader_NNN.glsl`, and each ARB assembly program to `arbprog_NNN.txt`. Shaders that still fail are written to `shader_fail_NN.glsl` (ARB: `arbprog_fail_NN.txt`) regardless. |
-| `LB_INPUT_SCRIPT=file` | Play scripted input. One command a line: `<frame> coin\|start\|service\|reload\|test [player]`, `<frame> aim <player> <x> <y>` (0-65535), `<frame> fire\|sweep <player> on\|off`, `<frame> analog <channel> <0..1>`, `<frame> button <player> up\|down\|left\|right\|b1..b4\|<bit> on\|off`, `<frame> press <player> <bit>`. |
-| `LB_AUDIO_WAV=file` | Also write the mixed sound to a WAV file. |
-| `LB_FRAME_CLOCK=1` | Mix 1/60 s of sound per video frame instead of using the audio device (for repeatable captures). |
-| `LB_DIPSW=0x60` | DIP switch byte (default 0x60: 1280x768, horizontal). |
-| `LB_SAVE_DIR=dir` | Where `eeprom.bin` and `sram.bin` live. |
+| `AF_DEBUG_LB_VERBOSE=1` | Log file and device access. |
+| `AF_DEBUG_LB_SHOT_EVERY=N` | Save a PPM of every Nth frame. |
+| `AF_DEBUG_LB_GL_TRACE=N` or `N-M` | Log every GL and library call during frame N (or frames N to M). Frame 0 is everything before the first swap. |
+| `AF_DEBUG_LB_GL_CHECK=1` | Check `glGetError` after every GL call and log the calls that raise errors. |
+| `AF_DEBUG_LB_SHOT_FBO=N` | Screenshots read the game's framebuffer object N instead of the screen. |
+| `AF_DEBUG_LB_SHADER_DUMP=1` | Write each shader, after the GLSL fixes, to `shader_NNN.glsl`, and each ARB assembly program to `arbprog_NNN.txt`. Shaders that still fail are written to `shader_fail_NN.glsl` (ARB: `arbprog_fail_NN.txt`) regardless. |
+| `AF_DEBUG_LB_INPUT_SCRIPT=file` | Play scripted input. One command a line: `<frame> coin\|start\|service\|reload\|test [player]`, `<frame> aim <player> <x> <y>` (0-65535), `<frame> fire\|sweep <player> on\|off`, `<frame> analog <channel> <0..1>`, `<frame> button <player> up\|down\|left\|right\|b1..b4\|<bit> on\|off`, `<frame> press <player> <bit>`. |
+| `AF_DEBUG_LB_AUDIO_WAV=file` | Also write the mixed sound to a WAV file. |
+| `AF_DEBUG_LB_FRAME_CLOCK=1` | Mix 1/60 s of sound per video frame instead of using the audio device (for repeatable captures). |
+| `AF_DEBUG_LB_DIPSW=0x60` | DIP switch byte (default 0x60: 1280x768, horizontal). |
+| `AF_DEBUG_LB_SAVE_DIR=dir` | Where `eeprom.bin` and `sram.bin` live. |
 
 ## Licence
 

@@ -96,7 +96,7 @@ const device_ops *device_for_fd(int fd);
 // read-only files the cabinet's kernel provides (/proc/...); 1 if path is one
 int virtual_file(const char *path, const void **data, size_t *size);
 
-// a translated program's tables (gen_tables.c, written by tools/x86recomp)
+// a translated program's tables (gen_tables.c, written by common/tools/x86recomp)
 typedef struct gen_program {
     const char *name;
     const uint32_t *fn_addr;
