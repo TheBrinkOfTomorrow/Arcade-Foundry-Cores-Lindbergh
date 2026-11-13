@@ -1,0 +1,1 @@
+# 0xaddress+offset bytes, applied to the code before translation (main.exe has no symbols)

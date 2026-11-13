@@ -74,10 +74,25 @@ int guest_vformat(char *out, size_t n, const char *fmt, uint32_t args);
 
 // libraries
 void hle_libc_init(void);
+// libstdc++.so.6's streams, string members and exception classes (hle_cxx.c)
+extern const hle_entry cxx_table[];
+void hle_cxx_init(void);   // after the program is loaded: its copies of the library's objects
+uint32_t cxx_str_new(const char *s, uint32_t n);   // a std::string's characters (hle_libc.c)
+uint32_t cxx_str_grab(uint32_t str);                // another reference to the string at str
+void cxx_str_release(uint32_t chars);
+uint32_t cxx_str_empty(void);
 void hle_thread_init(CPU *main);
 void hle_gfx_init(void);
 void hle_lindbergh_init(void);
 void audio_frame(void);     // once per video frame
+void hle_audio_open(void);  // the mixer, for OpenAL (hle_openal.c)
+void al_mix(float *out, int frames);   // OpenAL's sources into the mix (hle_audio.c's lock held)
+// ALSA's PCM playback (hle_alsa.c): into the mix (hle_audio.c's lock held), reset, its functions
+void alsa_mix(float *out, int frames);
+void alsa_reset(void);
+void hle_alsa_init(void);
+void al_reset(void);
+void audio_render_frame(void);   // render mode: one frame's sound, from run_frame
 CPU *cpu_new(void);
 CPU *cpu_current(void);
 void cpu_set_current(CPU *c);
@@ -141,6 +156,22 @@ void run_game(const gen_program *p, const char *elf, int argc, char **argv);
 extern volatile int guest_stopping;
 void guest_exit_thread(void) __attribute__((noreturn));
 void guest_sleep_us(uint64_t us);      // a sleep a stop cuts short
+
+// The one time source the game sees (clock.c): the host's clocks, or in render
+// mode (afcore option clock=frames) 1/60 s per run_frame
+struct timespec;
+extern int clk_render;
+void clk_init(int render);
+uint64_t clk_mono_ns(void);            // CLOCK_MONOTONIC's, or render time
+uint64_t clk_real_ns(void);            // CLOCK_REALTIME's, or render time
+void clk_sleep_until(uint64_t at);     // render mode: until clk_mono_ns reaches at
+int clk_wait_slice(uint64_t until, struct timespec *host_deadline);
+void clk_frame(void);
+void clk_frame_done(void);
+void clk_hold(void);
+void clk_presenting(void);
+int clk_at_limit(void);
+int clk_frame_over(void);
 void guest_stop(void);
 void guest_reset(void);
 void hle_thread_stop(void);

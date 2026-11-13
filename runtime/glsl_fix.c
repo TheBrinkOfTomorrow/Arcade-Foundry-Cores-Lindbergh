@@ -1,6 +1,6 @@
 // Make the games' GLSL acceptable to a strict compiler. The cabinets ran
 // NVIDIA's driver, which also takes Cg-isms that GLSL 1.10/1.20 forbids:
-//   half/half2/half3/half4 types
+//   half/half2/half3/half4 types, and Cg's float2/3/4 and fixed types
 //   samplers declared at global scope without "uniform"
 //   C-style brace initializers:  const mat3 m = {{..},{..},{..}};
 //   assignments that change vector size: vec4 = vec2, vec3 = float (Cg pads
@@ -131,6 +131,9 @@ static const char helpers[] =
     "#define half float\n#define half2 vec2\n#define half3 vec3\n#define half4 vec4\n"
     // Cg's names, which NVIDIA's GLSL took too (Sega Race TV)
     "#define fixed float\n#define fixed2 vec2\n#define fixed3 vec3\n#define fixed4 vec4\n"
+    // and its vector types under their own names (2 Spicy's lighting: float3 litpos)
+    "#define float2 vec2\n#define float3 vec3\n#define float4 vec4\n"
+    "#define float2x2 mat2\n#define float3x3 mat3\n#define float4x4 mat4\n"
     "#define tex2D texture2D\n#define tex2Dproj texture2DProj\n#define texCUBE textureCube\n"
     "float _lb1(float x){return x;} float _lb1(int x){return float(x);} float _lb1(vec2 x){return x.x;}\n"
     "float _lb1(vec3 x){return x.x;} float _lb1(vec4 x){return x.x;}\n"
@@ -162,7 +165,8 @@ static int type_size(const char *t, size_t n)
 {
     static const struct { const char *w; int size; } types[] = {
         {"float", 1}, {"half", 1}, {"vec2", 2}, {"half2", 2}, {"vec3", 3}, {"half3", 3},
-        {"vec4", 4}, {"half4", 4}, {"int", 0}, {"bool", 0}, {"ivec2", 0}, {"ivec3", 0},
+        {"vec4", 4}, {"half4", 4}, {"float2", 2}, {"float3", 3}, {"float4", 4}, {"fixed", 1},
+        {"fixed2", 2}, {"fixed3", 3}, {"fixed4", 4}, {"int", 0}, {"bool", 0}, {"ivec2", 0}, {"ivec3", 0},
         {"ivec4", 0}, {"bvec2", 0}, {"bvec3", 0}, {"bvec4", 0}, {"mat2", 0}, {"mat3", 0},
         {"mat4", 0}, {"void", 0},
     };

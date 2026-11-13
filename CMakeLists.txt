@@ -16,7 +16,8 @@ set(GAME_TITLE "The House of the Dead 4")
 set(GAME_WIDTH 1280)
 set(GAME_HEIGHT 768)
 set(GAME_CONTROLS gun)            # gun or driving: what the core maps the front end's controls to
-set(GAME_DRIVE_BOARD position)    # the steering drive board on /dev/tts/0: position (Race TV) or status (OutRun 2 SP)
+set(GAME_DRIVE_BOARD position)    # what is on /dev/tts/0: a drive board, position (Race TV), status (OutRun 2 SP) or ready (Hummer), bike (Harley-Davidson), or touch: a touch panel (Primeval Hunt)
+set(GAME_CWD /home/disk0)         # where the cabinet starts the game (getcwd); its relative paths start at the program's folder
 set(GAME_CORE_VERSION 1.0.0)      # the game's core version (afcore_api.core_version)
 if(EXISTS ${CMAKE_SOURCE_DIR}/games/${GAME}/game.cmake)
   include(${CMAKE_SOURCE_DIR}/games/${GAME}/game.cmake)
@@ -191,7 +192,17 @@ if(GAME_CONTROLS STREQUAL "driving")
 endif()
 if(GAME_DRIVE_BOARD STREQUAL "status")
   add_compile_definitions(LB_DRIVE_STATUS)
+elseif(GAME_DRIVE_BOARD STREQUAL "ready")
+  add_compile_definitions(LB_DRIVE_STATUS LB_DRIVE_READY)
+elseif(GAME_DRIVE_BOARD STREQUAL "bike")    # status bytes, 4-byte replies to reads (Harley-Davidson)
+  add_compile_definitions(LB_DRIVE_BIKE)
+elseif(GAME_DRIVE_BOARD STREQUAL "touch")   # not a drive board: a touch panel (Primeval Hunt)
+  add_compile_definitions(LB_TOUCH_PANEL)
 endif()
+if(GAME_WHEEL2_ANALOG)   # a twin cabinet's second wheel: its JVS analog channel, held at the centre
+  add_compile_definitions(LB_WHEEL2=${GAME_WHEEL2_ANALOG})
+endif()
+add_compile_definitions(LB_GAME_CWD="${GAME_CWD}")
 # the raw values of a gun's left and right edges, then top and bottom, where
 # the game's default calibration has them (Let's Go Jungle: a quarter of the
 # range, both reversed); without it, the whole range. GAME_GUN_SWAP_XY: the
@@ -199,6 +210,11 @@ endif()
 if(GAME_GUN_RANGE)
   string(REPLACE ";" "," gun_range "${GAME_GUN_RANGE}")
   add_compile_definitions(LB_GUN_RANGE=${gun_range})
+endif()
+# GAME_GUN_VIEW_X0: the guns' screen is the picture right of this (0 .. 1 across
+# it; Primeval Hunt: 0.5, its touch screen on the left)
+if(GAME_GUN_VIEW_X0)
+  add_compile_definitions(LB_GUN_VIEW_X0=${GAME_GUN_VIEW_X0}f)
 endif()
 if(GAME_GUN_SWAP_XY)
   add_compile_definitions(LB_GUN_SWAP_XY)
@@ -298,10 +314,34 @@ add_custom_command(
 
 # the runtime without a host: lindbergh-run adds host_sdl.c, the core core_api.c
 add_library(lb_runtime OBJECT
-  runtime/core.c runtime/hle_libc.c runtime/hle_thread.c runtime/hle_gfx.c
-  runtime/hle_lindbergh.c runtime/hle_audio.c runtime/glsl_fix.c runtime/nv_vertex_program.c runtime/arb_lower.c runtime/input.c ${GLGEN}/hle_gl_gen.c)
+  runtime/core.c runtime/clock.c runtime/hle_libc.c runtime/hle_thread.c runtime/hle_gfx.c
+  runtime/hle_lindbergh.c runtime/hle_cxx.c runtime/hle_alsa.c runtime/hle_audio.c runtime/hle_openal.c runtime/glsl_fix.c runtime/nv_vertex_program.c runtime/arb_lower.c runtime/input.c ${GLGEN}/hle_gl_gen.c)
 target_include_directories(lb_runtime PRIVATE runtime ${AFCORE_INCLUDE}) # af_debug.h
 target_compile_options(lb_runtime PRIVATE ${WARN})
+# the X server's one video mode (hle_lindbergh.c): the game's screen, or GAME_MODE_SIZE where
+# the game asks for a larger display than it draws on (the window is then the screen's size)
+if(NOT GAME_MODE_SIZE)
+  set(GAME_MODE_SIZE ${CORE_WIDTH} ${CORE_HEIGHT})
+endif()
+list(GET GAME_MODE_SIZE 0 lb_mode_w)
+list(GET GAME_MODE_SIZE 1 lb_mode_h)
+target_compile_definitions(lb_runtime PRIVATE LB_SCREEN_W=${CORE_WIDTH} LB_SCREEN_H=${CORE_HEIGHT} LB_MODE_W=${lb_mode_w} LB_MODE_H=${lb_mode_h})
+# GAME_TEST_ON_EXIT: the game exits on TEST and its test menu is the program
+# started with -t (Harley-Davidson); after one exits the core starts the other
+if(GAME_TEST_ON_EXIT)
+  add_compile_definitions(LB_TEST_ON_EXIT)
+endif()
+# GAME_NET_HOST "e,u,j": the last byte of the cabinet's address on 192.168.1.x for
+# each region (Export, USA, Japan; 2 when not set)
+if(GAME_NET_HOST)
+  add_compile_definitions(LB_NET_HOST=${GAME_NET_HOST})
+endif()
+# a framebuffer larger than the screen (GAME_FB_SIZE w h): the screen is its bottom left (host_core*)
+if(GAME_FB_SIZE)
+  list(GET GAME_FB_SIZE 0 lb_fb_w)
+  list(GET GAME_FB_SIZE 1 lb_fb_h)
+  add_compile_definitions(LB_FB_W=${lb_fb_w} LB_FB_H=${lb_fb_h})
+endif()
 target_include_directories(lb_runtime PRIVATE ${GL_INCLUDES})
 
 if(LB_RUN)
@@ -311,7 +351,7 @@ if(LB_RUN)
     target_include_directories(${target} PRIVATE runtime ${AFCORE_INCLUDE})
     target_compile_definitions(${target} PRIVATE LB_PROGRAM=gen_program_${name})
     target_compile_options(${target} PRIVATE ${WARN})
-    target_link_libraries(${target} PRIVATE SDL2::SDL2 OpenGL::GL m pthread)
+    target_link_libraries(${target} PRIVATE SDL2::SDL2 OpenGL::GL m pthread z)
   endfunction()
   lindbergh_run(lindbergh-run game)
   if(GAME_TEST_ELF)
@@ -321,14 +361,12 @@ endif()
 
 if(LB_CORE)
   set(core afcore_${CORE_ROMSET})
-  # a program's path under the game folder (the one holding disk0), its size
+  # a program's path under the game folder (the one holding disk0, disk1...), its size
   function(core_program_path elf var)
-    string(FIND "${elf}" "/disk0/" at REVERSE)
-    if(at LESS 0)
-      message(FATAL_ERROR "${elf} is not inside a game folder's disk0")
+    if(NOT elf MATCHES "^(.*)/(disk[0-9]/.*)$")
+      message(FATAL_ERROR "${elf} is not inside a game folder's disk0..disk9")
     endif()
-    math(EXPR at "${at} + 1")
-    string(SUBSTRING "${elf}" ${at} -1 rel)
+    set(rel "${CMAKE_MATCH_2}")
     file(SIZE ${elf} size)
     set(${var} "${rel}" PARENT_SCOPE)
     set(${var}_SIZE ${size} PARENT_SCOPE)
@@ -372,18 +410,18 @@ if(LB_CORE)
   if(LB_MTLGLES)
     set_target_properties(${core} PROPERTIES FRAMEWORK TRUE
       MACOSX_FRAMEWORK_IDENTIFIER com.thebrinkoftomorrow.arcadefoundry.insertcoin.${core})
-    target_link_libraries(${core} PRIVATE GL afc::mtlgles "-framework Foundation" "-framework CoreVideo" m pthread)
+    target_link_libraries(${core} PRIVATE GL afc::mtlgles "-framework Foundation" "-framework CoreVideo" m pthread z)
   elseif(LB_IOS)
     set_target_properties(${core} PROPERTIES FRAMEWORK TRUE
       MACOSX_FRAMEWORK_IDENTIFIER com.thebrinkoftomorrow.arcadefoundry.insertcoin.${core})
-    target_link_libraries(${core} PRIVATE GL "-framework OpenGLES" "-framework Foundation" "-framework CoreVideo" m pthread)
+    target_link_libraries(${core} PRIVATE GL "-framework OpenGLES" "-framework Foundation" "-framework CoreVideo" m pthread z)
   elseif(APPLE)
     set_target_properties(${core} PROPERTIES FRAMEWORK TRUE
       MACOSX_FRAMEWORK_IDENTIFIER com.thebrinkoftomorrow.arcadefoundry.insertcoin.${core})
-    target_link_libraries(${core} PRIVATE OpenGL::GL m pthread)
+    target_link_libraries(${core} PRIVATE OpenGL::GL m pthread z)
   else()
     find_library(EGL_LIBRARY EGL REQUIRED)
-    target_link_libraries(${core} PRIVATE ${EGL_LIBRARY} OpenGL::GL m pthread)
+    target_link_libraries(${core} PRIVATE ${EGL_LIBRARY} OpenGL::GL m pthread z)
   endif()
   # drives the core as the front end does, without a window
   add_executable(core_test tools/core_test.c)

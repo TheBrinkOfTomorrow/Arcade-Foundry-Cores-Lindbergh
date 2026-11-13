@@ -17,9 +17,16 @@
 // that time their loading by the clock (OutRun 2 SP); otherwise as fast as it goes.
 // CORE_TEST_EVERY=N prints the progress line every N frames (default 600).
 // CORE_TEST_OPTION=name=value sets one of the core's options (afcore 5.3) first.
+// For checking video renders (CORE_TEST_OPTION=clock=frames): CORE_TEST_SLOW=ms
+// waits that long after each frame, as a slow renderer does; CORE_TEST_WAV=file
+// writes the sound (48 kHz stereo); CORE_TEST_HASH=file writes one line per
+// frame, the frame number, a hash of its screen (to compare two runs), the
+// sound frames read so far and the screen's mean brightness (0-255). The end
+// line gives the sound frames per video frame, fewest and most.
 #include "afcore.h"
 #include <dlfcn.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -100,8 +107,12 @@ int main(int argc, char **argv)
     int pace = getenv("CORE_TEST_PACE") != NULL;
     double pace_hz = pace && atof(getenv("CORE_TEST_PACE")) > 1 ? atof(getenv("CORE_TEST_PACE")) : 0;
     int surfaces = 0, surfaces_seen = 0;
-    size_t audio_frames = 0;
+    size_t audio_frames = 0, per_min = (size_t)-1, per_max = 0;
     static float buf[48000 * 2];
+    int slow_ms = getenv("CORE_TEST_SLOW") ? atoi(getenv("CORE_TEST_SLOW")) : 0;
+    FILE *wav = getenv("CORE_TEST_WAV") ? fopen(getenv("CORE_TEST_WAV"), "wb") : NULL;
+    FILE *hashes = getenv("CORE_TEST_HASH") ? fopen(getenv("CORE_TEST_HASH"), "w") : NULL;
+    if (wav) fwrite("RIFF\0\0\0\0WAVEfmt \x10\0\0\0\1\0\2\0\x80\xbb\0\0\0\xee\x02\0\4\0\x10\0data\0\0\0\0", 1, 44, wav);
     for (;;) {
         while (next_frame < 0 || next_frame <= frame) {
             if (next_frame >= 0) {
@@ -162,11 +173,37 @@ int main(int argc, char **argv)
                 nanosleep(&ts, NULL);
             }
         }
-        size_t n;
+        if (slow_ms) {
+            struct timespec ts = {slow_ms / 1000, (long)(slow_ms % 1000) * 1000000};
+            nanosleep(&ts, NULL);
+        }
+        size_t n, this_frame = 0;
         while ((n = api->audio_read(core, 0, buf, 48000)) > 0) {
             audio_frames += n;
-            for (size_t i = 0; i < 2 * n; i++)
+            this_frame += n;
+            for (size_t i = 0; i < 2 * n; i++) {
                 if (buf[i] > audio_peak) audio_peak = buf[i];
+                if (wav) {
+                    float v = buf[i] * 32768.0f;
+                    int16_t q = v > 32767 ? 32767 : v < -32768 ? -32768 : (int16_t)v;
+                    fwrite(&q, 2, 1, wav);
+                }
+            }
+        }
+        if (audio_frames) {   // from the game's first sound
+            if (this_frame < per_min) per_min = this_frame;
+            if (this_frame > per_max) per_max = this_frame;
+        }
+        if (hashes) {
+            int sw, sh;
+            const uint32_t *px = api->screen(core, &sw, &sh);
+            uint64_t hsh = 1469598103934665603ull, sum = 0;
+            for (int i = 0; i < sw * sh; i++) {
+                hsh = (hsh ^ px[i]) * 1099511628211ull;
+                sum += ((px[i] >> 16 & 255) + (px[i] >> 8 & 255) + (px[i] & 255)) / 3;
+            }
+            fprintf(hashes, "%d %016llx %zu %.1f\n", frame, (unsigned long long)hsh, audio_frames,
+                    sw * sh ? (double)sum / (sw * sh) : 0.0);
         }
         const char *e = api->error(core);
         if (e) {
@@ -179,7 +216,17 @@ int main(int argc, char **argv)
                    audio_frames / (now() - t0), audio_peak);
     }
 done:
-    printf("end at frame %d: %.1f fps, audio %zu frames, peak %.3f\n", frame, frame / (now() - t0), audio_frames, audio_peak);
+    printf("end at frame %d: %.1f fps, audio %zu frames, peak %.3f, per frame %zu..%zu\n", frame, frame / (now() - t0),
+           audio_frames, audio_peak, per_min == (size_t)-1 ? 0 : per_min, per_max);
+    if (wav) {
+        uint32_t data = (uint32_t)(audio_frames * 4), riff = data + 36;
+        fseek(wav, 4, SEEK_SET);
+        fwrite(&riff, 4, 1, wav);
+        fseek(wav, 40, SEEK_SET);
+        fwrite(&data, 4, 1, wav);
+        fclose(wav);
+    }
+    if (hashes) fclose(hashes);
     api->save(core);
     api->destroy(core);
     return 0;

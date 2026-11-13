@@ -1,0 +1,8 @@
+# 0xaddress+offset bytes, applied to the code before translation (chopperM.elf has no symbols)
+# Its keychip check (the function at 0x818ba9a): 1 KB of the game's data
+# decrypted with the keychip (amDongleDecryptEx, taken as done: overrides.txt)
+# and compared with a plain copy (strncmp); the match is a flag at 0x882eaa8,
+# and without it the game stops at boot with Error 15 ("Game Program Not
+# Found."). The comparison's result (sete %dl; movzbl %dl, %eax) becomes a
+# match (mov $1, %eax; nop), as Hummer Extreme's check is patched
+0x818bb39+0 b8 01 00 00 00 90

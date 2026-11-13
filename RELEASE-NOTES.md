@@ -2,6 +2,28 @@
 
 Newest first. Each release is also on the repository's Releases page.
 
+## 1.3.0 (2026-11-12)
+
+**Arcade Foundry Cores: Lindbergh 1.3.0**
+
+The Lindbergh cores as shipped with Insert Coin 1.3.0.
+
+- **Video renders keep the game's sound:** with the afcore option
+  `clock=frames`, which the app's `--video` sets, game time follows the
+  frames (1/60 s each, 800 samples of sound a frame) however slow the render,
+  so the sound stays in step with the picture (#95). Normal play is
+  unchanged. Every set offers `clock=realtime|frames`; core versions: HotD4,
+  Let's Go Jungle and OutRun 2 SP 1.1.0, Race TV 1.2.0.
+- **afcore 5.4:** the cores build against the new interface. Lindbergh games
+  have no save states (they run on host threads), so the save-state calls
+  stay empty and the app offers none for them.
+- **Not in the app yet:** first bring-ups of 2 Spicy (`2spicy`), Let's Go
+  Jungle! Special (`letsgojusp`), Hummer and Hummer Extreme Edition
+  (`hummer`, `hummerxt`), Primeval Hunt (`primevah`), Harley-Davidson: King of
+  the Road (`hdkotr`), and Ghost Squad Evolution on Metal (`gsevo`) are in
+  this repository for later releases (1.4.0 or later). Insert Coin 1.3.0
+  doesn't list them.
+
 ## 1.2.0 (2026-11-06)
 
 **Arcade Foundry Cores: Lindbergh 1.2.0**

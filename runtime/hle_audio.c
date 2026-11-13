@@ -124,6 +124,8 @@ static void mix(float *out, int frames)
             v->pos += step;
         }
     }
+    al_mix(out, frames);   // OpenAL's sources (hle_openal.c)
+    alsa_mix(out, frames);   // ALSA's PCM (hle_alsa.c)
     pthread_mutex_unlock(&lock);
 }
 
@@ -178,7 +180,7 @@ void audio_frame(void)
             hle_log("voices: %d playing\n", act);
         }
     }
-    if (!frame_clock) return;
+    if (!frame_clock || clk_render) return;   // render mode: audio_render_frame
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     double now = ts.tv_sec + ts.tv_nsec * 1e-9;
@@ -194,6 +196,16 @@ void audio_frame(void)
         audio_mix(buf, n);
         host_audio_push(buf, n);
     }
+}
+
+// Render mode (clock.c): run_frame makes each frame's sound, exactly 1/60 s
+// (800 samples at 48 kHz), whether the game presented a picture in it or not
+void audio_render_frame(void)
+{
+    if (!frame_clock) return;
+    static int16_t buf[OUT_RATE / 60 * 2];
+    audio_mix(buf, OUT_RATE / 60);
+    host_audio_push(buf, OUT_RATE / 60);
 }
 
 static void audio_open(void)
@@ -218,7 +230,12 @@ void hle_audio_reset(void)
     memset(voices, 0, sizeof voices);
     opened = frame_clock = 0;
     last = owed = 0;
+    al_reset();
+    alsa_reset();
 }
+
+// OpenAL's device opening (hle_openal.c): the mixer starts as for the sound card
+void hle_audio_open(void) { audio_open(); }
 
 // ---- API -----------------------------------------------------------------------------
 #define VOICE(h) voice *v = find(h); if (!v) RET(0x8000a012u)   // SEGA_ERROR_BAD_HANDLE

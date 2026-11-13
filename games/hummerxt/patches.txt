@@ -1,0 +1,26 @@
+# symbol+offset bytes, applied to the code before translation
+# amSysData_InitCredit (AM library): a new EEPROM's credit settings have the
+# coin assignment (byte 4 of the settings, movb $0x1, 0x24(%edx)) at 1, and
+# Hummer Extreme stops at boot with Error 1001 ("There is an error in the COIN
+# ASSIGNMENTS SETTINGS", clErrorDisp::checkError_, clWakeupInit) until an
+# operator sets it in the test menu. A new EEPROM gets 0, the setting it wants
+amSysData_InitCredit+33 00
+# clInputJVS::setDefaultAccel, setDefaultBrake: a new backup's pedal
+# calibration (accelerator and brake) is 0 to 0xff00, which the game takes as
+# not calibrated (the lowest must be over 0x100, the highest at most 0xfdff;
+# also clWakeupInit) and it stops at boot with Error 1011 ("The CALIBRATION
+# SETTING has not been set correctly") until an operator calibrates in the
+# test menu. Out of range ends are taken as 0x400 and 0xfc00 instead, near the
+# emulated pedals' full range (0 to 0xffff), and not marked: movb $0x1,
+# 0xa567424 becomes movl $0x400, %eax and a jump to the highest's check, and
+# movl $0xfc00, %edx and a jump on. The steering centre (0x8000) passes
+_ZN10clInputJVS15setDefaultAccelEiii+57 b8 00 04 00 00 eb b6
+_ZN10clInputJVS15setDefaultAccelEiii+66 ba 00 fc 00 00 eb af
+_ZN10clInputJVS15setDefaultBrakeEiii+55 b8 00 04 00 00 eb b8
+_ZN10clInputJVS15setDefaultBrakeEiii+64 ba 00 fc 00 00 eb b1
+# clErrorDisp::checkError_: the keychip check decrypts 16 bytes with the
+# keychip (amDongleSetIv, amDongleDecryptEx) and compares them with the game's
+# text; the emulated keychip has no key, and the game stops with Error 15
+# ("Game Program Not Found."). The comparison is taken as equal (je becomes
+# jmp), as HotD4's JvsMgr_CheckDongleDecrypt
+_ZN11clErrorDisp11checkError_Ev+bb6 e9 b3 f4 ff ff 90

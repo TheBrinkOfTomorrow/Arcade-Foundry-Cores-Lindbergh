@@ -71,6 +71,8 @@ static pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
 static int stop_reason, destroying;
 static int go;                          // run_frame's permit for the game to pass its next present
 static unsigned frame_seq;
+static int opt_render;                  // clock=frames for the next create (set_option)
+static int render_overdue;              // render mode: a frame's picture was late, the next ones don't wait for it
 // surface: the frame as the host's GPU buffer (screen_surface, iOS), its
 // pixels copied out into px only when screen() asks (px_from_surface)
 typedef struct { uint32_t *px; size_t cap; int w, h; void *surface; int px_from_surface; } framebuf;
@@ -173,6 +175,7 @@ static int booting(void)
 void host_present(void)
 {
     double t_start = perf_now(), cpu_start = thread_cpu();
+    clk_presenting();
     int w, h;
     host_gl_size(&w, &h);
     size_t n = (size_t)w * h;
@@ -266,6 +269,15 @@ static uint16_t gun_raw(float v, int y)
 
 static int on_screen(float x, float y) { return x >= 0 && x <= 1 && y >= 0 && y <= 1; }
 
+// a picture with the guns' screen on its right (LB_GUN_VIEW_X0: where that
+// screen starts, 0 .. 1 across the picture; Primeval Hunt's 1280x480, its
+// touch screen on the left): the guns' x across that screen
+#ifdef LB_GUN_VIEW_X0
+static float gun_view_x(float x) { return (x - LB_GUN_VIEW_X0) / (1.0f - LB_GUN_VIEW_X0); }
+#else
+static float gun_view_x(float x) { return x; }
+#endif
+
 void host_input(void)
 {
     pthread_mutex_lock(&lock);
@@ -277,9 +289,17 @@ void host_input(void)
 #ifdef CORE_DRIVING
     // Sega Race TV's cabinet: steering, gas and brake on analogs 0-2, the gear
     // lever (up, neutral, down) and boost on player 2's switches
+#ifdef LB_DRIVE_BIKE
+    // Harley-Davidson's bike: the throttle grip on analog 0, the handlebar on
+    // 1 (centred at the middle), the brake lever on 2
+    jvs_in.analog[0] = gun_axis(in.accel);
+    jvs_in.analog[1] = gun_axis((in.steer + 1) / 2);
+    jvs_in.analog[2] = gun_axis(in.brake);
+#else
     jvs_in.analog[0] = gun_axis((in.steer + 1) / 2);
     jvs_in.analog[1] = gun_axis(in.accel);
     jvs_in.analog[2] = gun_axis(in.brake);
+#endif
     // the gear lever is sequential and springs back to neutral: each push up or
     // down shifts one gear. It is out while the shift button is held, and for at
     // least LEVER_MIN_S after a press, so a quick paddle tap is not missed (by
@@ -288,7 +308,7 @@ void host_input(void)
     // shifted between 1st and 2nd, and name entry read it as player 2 up held.
     // gear is ignored: front ends send it with the shift buttons.
     const double LEVER_MIN_S = 0.05;
-    double now = perf_now();
+    double now = clk_render ? clk_mono_ns() * 1e-9 : perf_now();
     if (rise & AFCORE_SHIFT_UP) lever = SW_UP, lever_until = now + LEVER_MIN_S;
     else if (rise & AFCORE_SHIFT_DOWN) lever = SW_DOWN, lever_until = now + LEVER_MIN_S;
     else if (now >= lever_until && !(b & (lever == SW_UP ? AFCORE_SHIFT_UP : AFCORE_SHIFT_DOWN))) lever = 0;
@@ -297,20 +317,38 @@ void host_input(void)
     if (b & AFCORE_VIEW1) p[0] |= SW_DOWN;
 #else
     const uint32_t trigger[2] = {AFCORE_TRIGGER1, AFCORE_TRIGGER2};
+    uint32_t pulled = b & (AFCORE_TRIGGER1 | AFCORE_TRIGGER2);
+#if defined(LB_TOUCH_PANEL) && defined(LB_GUN_VIEW_X0)
+    // the touch screen is the picture left of the guns' screen: a player's
+    // pointer there with the trigger pulled (a click, a finger) touches it,
+    // and does not shoot
+    touch_in.down = 0;
     for (int i = 0; i < 2; i++) {
+        float x = in.gun_x[i], y = in.gun_y[i];
+        if (x < 0 || x >= LB_GUN_VIEW_X0 || y < 0 || y > 1) continue;
+        if (b & trigger[i]) {
+            touch_in.down = 1;
+            touch_in.x = (uint16_t)(x / LB_GUN_VIEW_X0 * 4095.0f + 0.5f);
+            touch_in.y = (uint16_t)(y * 4095.0f + 0.5f);
+        }
+        pulled &= ~trigger[i];
+    }
+#endif
+    for (int i = 0; i < 2; i++) {
+        float gx = gun_view_x(in.gun_x[i]);
 #ifdef LB_GUN_SWAP_XY
         jvs_in.analog[2 * i] = gun_raw(in.gun_y[i], 1);
-        jvs_in.analog[2 * i + 1] = gun_raw(in.gun_x[i], 0);
+        jvs_in.analog[2 * i + 1] = gun_raw(gx, 0);
 #else
-        jvs_in.analog[2 * i] = gun_raw(in.gun_x[i], 0);
+        jvs_in.analog[2 * i] = gun_raw(gx, 0);
         jvs_in.analog[2 * i + 1] = gun_raw(in.gun_y[i], 1);
 #endif
         // as in the other gun cores, a shot off screen reloads (the cabinet's
         // reload is a switch in the gun)
-        if (!on_screen(in.gun_x[i], in.gun_y[i]) && (b & trigger[i])) p[i] |= SW_2;
+        if (!on_screen(gx, in.gun_y[i]) && (pulled & trigger[i])) p[i] |= SW_2;
     }
-    if (b & AFCORE_TRIGGER1) p[0] |= SW_1;
-    if (b & AFCORE_TRIGGER2) p[1] |= SW_1;
+    if (pulled & AFCORE_TRIGGER1) p[0] |= SW_1;
+    if (pulled & AFCORE_TRIGGER2) p[1] |= SW_1;
     if (b & AFCORE_BUTTON2) p[0] |= SW_2;
     // the gun's button (HotD4: a grenade), player 2's in buttons2
     if (b & AFCORE_BUTTON3) p[0] |= SW_3;
@@ -426,6 +464,11 @@ static void *supervise(void *p)
         // menu inside starts again
         // (or, asked for with /tmp/segaboot/test, in its menu)
         c->which = (c->which + 1) % NPROGRAMS;
+#ifdef LB_TEST_ON_EXIT
+        // the game exits when TEST is pressed and its test menu is the same
+        // program started with -t (Harley-Davidson): after one, the other
+        segaboot_test = 1;
+#endif
         // the TEST switch may still be held from entering the menu; the next
         // program sees it as the front end reports it
     }
@@ -506,6 +549,10 @@ static afcore *create(const char *rom_path, const char *save_dir, char *err, siz
     fresh = 0;
     stop_reason = STOP_NONE;
     go = 0;
+    render_overdue = 0;
+    clk_init(opt_render);
+    if (clk_render) hle_log("clock: render mode, 1/60 s of game time per frame\n");
+    opt_render = 0;   // an option holds for the next create only
     c->which = 0;
     the_core = c;
     pthread_create(&c->super, NULL, supervise, c);
@@ -534,6 +581,41 @@ static void destroy(afcore *c)
     free(c);
 }
 
+// Render mode (clock.c), under lock: one frame of time, then its picture.
+// The frame is over once the game has presented and the frame's time has run,
+// or once its time has run and the thread that presents waits for time past
+// it (a 30 frames a second cut-scene, the boot's frame limiter) or no thread
+// has presented yet (the game loading). A picture still late 1/4 s after the
+// frame's time has run (a load that doesn't read the clock) is not waited for
+// again until one comes: time then moves on at the real rate, as in normal play.
+// After it the game's threads are held until the next run_frame.
+static void render_wait(afcore *c, unsigned seq)
+{
+    clk_frame();
+    go = 1;
+    pthread_cond_broadcast(&cv);
+    double late = 0;
+    while (!c->error[0] && !guest_stopping) {
+        int at = clk_at_limit();
+        if (at && (frame_seq != seq || clk_frame_over() || render_overdue)) break;
+        if (at) {
+            double now = perf_now();
+            if (!late) late = now + 0.25;
+            else if (now >= late) {
+                render_overdue = 1;
+                break;
+            }
+        }
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 1000000;
+        if (ts.tv_nsec >= 1000000000) ts.tv_sec++, ts.tv_nsec -= 1000000000;
+        pthread_cond_timedwait(&cv, &lock, &ts);
+    }
+    if (frame_seq != seq) render_overdue = 0;
+    clk_frame_done();
+}
+
 static void run_frame(afcore *c, const afcore_input *in)
 {
     pthread_mutex_lock(&lock);
@@ -545,16 +627,20 @@ static void run_frame(afcore *c, const afcore_input *in)
     if (in) memcpy(&pending, in, in->size < sizeof pending ? in->size : sizeof pending);
     pending.size = sizeof pending;
     unsigned seq = frame_seq;
-    go = 1;
-    pthread_cond_broadcast(&cv);
-    // the next frame, or give up for now while the game is loading or
-    // changing programs; the front end keeps showing the last one
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_nsec += 100 * 1000 * 1000;
-    if (ts.tv_nsec >= 1000000000) ts.tv_sec++, ts.tv_nsec -= 1000000000;
-    while (frame_seq == seq && !c->error[0])
-        if (pthread_cond_timedwait(&cv, &lock, &ts) == ETIMEDOUT) break;
+    if (clk_render) {
+        render_wait(c, seq);
+    } else {
+        go = 1;
+        pthread_cond_broadcast(&cv);
+        // the next frame, or give up for now while the game is loading or
+        // changing programs; the front end keeps showing the last one
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 100 * 1000 * 1000;
+        if (ts.tv_nsec >= 1000000000) ts.tv_sec++, ts.tv_nsec -= 1000000000;
+        while (frame_seq == seq && !c->error[0])
+            if (pthread_cond_timedwait(&cv, &lock, &ts) == ETIMEDOUT) break;
+    }
     if (fresh) {
         framebuf t = frames[0];
         frames[0] = frames[1];
@@ -562,6 +648,7 @@ static void run_frame(afcore *c, const afcore_input *in)
         fresh = 0;
     }
     pthread_mutex_unlock(&lock);
+    if (clk_render) audio_render_frame();
 }
 
 static const uint32_t *screen(afcore *c, int *w, int *h)
@@ -681,11 +768,25 @@ static int check_roms(const char *rom_path, char *report, size_t report_size)
 
 // the settings the front end chooses (CORE_OPTIONS, from games/<game>/
 // game.cmake's GAME_OPTIONS): the region, for the games whose region the
-// runtime answers (hle_lindbergh.c)
+// runtime answers (hle_lindbergh.c); and for every game the clock, set to
+// frames by the front end's video renders (clock.c). The app's game page
+// shows only region=, so the clock stays out of its menus.
 #ifdef CORE_OPTIONS
 extern int lb_region;
+#define OPTIONS CORE_OPTIONS "clock=realtime|frames\n"
+#else
+#define OPTIONS "clock=realtime|frames\n"
+#endif
 static int set_option(const char *name, const char *value)
 {
+    if (!name || !value) return -1;
+    if (!strcmp(name, "clock")) {
+        if (!strcmp(value, "frames")) opt_render = 1;
+        else if (!strcmp(value, "realtime")) opt_render = 0;
+        else return -1;
+        return 0;
+    }
+#ifdef CORE_OPTIONS
     static const char *const regions[] = {"export", "usa", "japan"};
     if (strcmp(name, "region")) return -1;
     for (int i = 0; i < 3; i++)
@@ -693,13 +794,9 @@ static int set_option(const char *name, const char *value)
             lb_region = i;
             return 0;
         }
+#endif
     return -1;
 }
-#define OPTIONS CORE_OPTIONS
-#else
-#define OPTIONS NULL
-#define set_option NULL
-#endif
 
 const afcore_api *API_FN(CORE_ROMSET)(void)
 {
@@ -707,6 +804,7 @@ const afcore_api *API_FN(CORE_ROMSET)(void)
         AFCORE_API_VERSION, sizeof(afcore_api), AFCORE_MAKE_VERSION(CORE_VERSION_MAJOR, CORE_VERSION_MINOR, CORE_VERSION_PATCH), STR(CORE_ROMSET), CORE_TITLE,
         60.0, CORE_WIDTH, CORE_HEIGHT, create, destroy, run_frame, screen, audio_rate, audio_read, save,
         link_start, link_state, error, NULL, NULL, NULL, 0.0f, screen_surface, CHECK_ROMS, OPTIONS, set_option,
+        NULL, NULL, NULL,   // 5.4 save states: none (the game runs on host threads)
     };
     return &api;
 }

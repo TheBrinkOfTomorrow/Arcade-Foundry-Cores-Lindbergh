@@ -13,6 +13,8 @@ typedef struct obj {
     int kind;                // 1 mutex, 2 cond, 3 sem
     pthread_cond_t cv;
     uint32_t owner, depth;   // mutex: owning thread id, recursion depth
+    uint32_t tickets, served; // mutex: waiters in turn (taken, given the mutex)
+    uint32_t barges;          // mutex: taken ahead of the waiters since one was served
     uint32_t seq;            // cond: signals so far
     uint32_t count;          // sem
     struct obj *next;
@@ -134,6 +136,14 @@ static void h_pthread_join(CPU *c)
 }
 
 static void h_pthread_detach(CPU *c) { RET(0); }
+static void h_pthread_exit(CPU *c)
+{
+    if (self_id > 1) {   // a thread of the game's: its return value, then its cleanup (thread_done)
+        threads[self_id - 1].ret = ARG(0);
+        pthread_exit(NULL);
+    }
+    guest_exit_thread();
+}
 static void h_pthread_cancel(CPU *c) { hle_log("pthread_cancel %d ignored\n", ARG(0)); RET(0); }
 static void h_pthread_self(CPU *c) { RET(self_id ? self_id : 1); }
 static void h_zero(CPU *c) { RET(0); }
@@ -160,10 +170,34 @@ static void h_pthread_attr_setstacksize(CPU *c)
 // ---- mutexes (recursive, as the game creates them) and condition variables -------------
 static uint32_t me(void) { return self_id ? self_id : 1; }
 
+// Taken as it comes free, as before, except that a free mutex goes to the
+// threads already waiting for it once others have taken it ahead of them
+// BARGE_MAX times. Primeval Hunt's main thread polls a flag under a mutex: it
+// took the mutex back each time before the waiting thread (CRI's sound) woke,
+// and the game stopped (Linux gives a waiter its turn sooner). Always taking
+// turns cost other games frames (each unlock then waits for a waiter to wake).
+#define BARGE_MAX 8
+static int may_barge(obj *m)   // a thread that holds no ticket may take it now
+{
+    if (m->owner) return 0;
+    if (m->served == m->tickets) return 1;     // none waiting
+    if (m->barges >= BARGE_MAX) return 0;      // the waiters' turn
+    m->barges++;
+    return 1;
+}
+
 static void lock_mutex(obj *m, uint32_t depth)
 {
-    while (m->owner && m->owner != me()) wait_on(&m->cv);
-    m->owner = me();
+    if (m->owner != me()) {
+        if (may_barge(m)) m->owner = me();
+        else {
+            uint32_t t = m->tickets++;
+            while (m->owner || m->served != t) wait_on(&m->cv);
+            m->served++;
+            m->barges = 0;
+            m->owner = me();
+        }
+    }
     m->depth += depth;
 }
 
@@ -239,7 +273,7 @@ static void h_mutex_trylock(CPU *c)
     pthread_mutex_lock(&sync_lock);
     obj *m = lookup(ARG(0), 1);
     int r = 16;   // EBUSY
-    if (!m->owner || m->owner == me()) {
+    if (m->owner == me() || may_barge(m)) {
         m->owner = me();
         m->depth++;
         r = 0;
@@ -259,9 +293,15 @@ static void h_cond_timedwait(CPU *c)
     m->owner = 0;
     m->depth = 0;
     pthread_cond_broadcast(&m->cv);
+    // render mode: until in the frames' time, a slice at a time (clock.c)
+    uint64_t until_ns = (uint64_t)until.tv_sec * 1000000000ull + (uint64_t)until.tv_nsec;
     while (cv->seq == seq && !r) {
         check_stop();
-        if (pthread_cond_timedwait(&cv->cv, &sync_lock, &until)) r = 110;   // ETIMEDOUT
+        struct timespec slice;
+        if (clk_render) {
+            if (!clk_wait_slice(until_ns, &slice)) r = 110;   // ETIMEDOUT
+            else pthread_cond_timedwait(&cv->cv, &sync_lock, &slice);
+        } else if (pthread_cond_timedwait(&cv->cv, &sync_lock, &until)) r = 110;   // ETIMEDOUT
         check_stop();
     }
     lock_mutex(m, depth);
@@ -367,7 +407,7 @@ static void h_sched_yield(CPU *c) { sched_yield(); RET(0); }
 
 static const hle_entry thread_table[] = {
     {"pthread_create", h_pthread_create}, {"pthread_join", h_pthread_join},
-    {"pthread_detach", h_pthread_detach}, {"pthread_cancel", h_pthread_cancel},
+    {"pthread_detach", h_pthread_detach}, {"pthread_cancel", h_pthread_cancel}, {"pthread_exit", h_pthread_exit},
     {"pthread_self", h_pthread_self}, {"pthread_getschedparam", h_pthread_getschedparam},
     {"pthread_setschedparam", h_zero}, {"pthread_attr_init", h_pthread_attr_init},
     {"pthread_attr_setstacksize", h_pthread_attr_setstacksize},

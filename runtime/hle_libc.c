@@ -20,6 +20,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <zlib.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -371,6 +372,11 @@ static void h_ferror(CPU *c)
     FILE *f = hostfile(ARG(0));
     RET(f ? ferror(f) : 1);
 }
+static void h_clearerr(CPU *c)
+{
+    FILE *f = hostfile(ARG(0));
+    if (f) clearerr(f);
+}
 
 static void h_fprintf(CPU *c)
 {
@@ -524,6 +530,18 @@ static void h_creat(CPU *c)
     RET(fd);
 }
 
+// Hummer makes it with mknod (__xmknod(ver, path, mode, &dev)) as a regular
+// file; nothing else is made
+static void h_xmknod(CPU *c)
+{
+    if (!strcmp(G(ARG(1)), "/tmp/segaboot/test")) {
+        segaboot_test = 1;
+        RET(0);
+        return;
+    }
+    RET((uint32_t)-1);
+}
+
 static void h_close(CPU *c)
 {
     int fd = (int)ARG(0);
@@ -560,14 +578,28 @@ static void h_fsync(CPU *c) { RET(0); }
 // (Sega Race TV stand-alone sets up a master on 127.0.0.1 and waits for its own
 // client). Binds to any address bind 127.0.0.1; sends to a broadcast or to the
 // cabinet's own address go to 127.0.0.1. The interface ioctls describe two
-// interfaces, lo (127.0.0.1/8) and eth0 (192.168.1.2/24). Linux's sockaddr,
+// interfaces, lo (127.0.0.1/8) and eth0 (192.168.1.2/24, or GAME_NET_HOST's). Linux's sockaddr,
 // option and flag numbers are translated to the host's; any 127.x.x.x is 127.0.0.1.
 static int is_sock(int fd) { return fd >= 0 && fd < MAX_FDS && fd_sock[fd]; }
 
-static const struct { const char *name; uint32_t addr, mask, bcast, flags; } ifaces[] = {
+// eth0's last byte: 2, or the game's for the region the front end chose
+// (GAME_NET_HOST, one per region: Export, USA, Japan). Harley-Davidson's
+// stand-alone cabinet is its own master at 192.168.1.9, .5 or .1 by region
+// (its port too) and connects to it
+extern int lb_region;
+#ifdef LB_NET_HOST
+#define NET_PEER_ETH0 1   // peers on the loopback are shown as eth0 (to_guest_addr)
+static const uint8_t net_host[3] = {LB_NET_HOST};
+#define ETH0_HOST net_host[lb_region >= 0 && lb_region < 3 ? lb_region : 0]
+#else
+#define NET_PEER_ETH0 0
+#define ETH0_HOST 2
+#endif
+static struct { const char *name; uint32_t addr, mask, bcast, flags; } ifaces[] = {
     {"lo", 0x0100007fu, 0x000000ffu, 0x00000000u, 0x0049},     // up, loopback, running
     {"eth0", 0x0201a8c0u, 0x00ffffffu, 0xff01a8c0u, 0x1043},   // up, broadcast, running, multicast
 };
+static void net_setup(void) { ifaces[1].addr = 0x0001a8c0u | (uint32_t)ETH0_HOST << 24; }
 static int iface_of(uint32_t ifr)   // the interface an ifreq names (eth0 when unknown)
 {
     for (int i = 0; i < 2; i++)
@@ -632,6 +664,10 @@ static void to_guest_addr(const struct sockaddr_in *h, uint32_t ga, uint32_t len
         wr16(ga, 2);
         memcpy(M + ga + 2, &h->sin_port, 2);
         memcpy(M + ga + 4, &h->sin_addr, 4);
+        // a game with its own address (GAME_NET_HOST) sees itself there, not
+        // at 127.0.0.1: Harley-Davidson's master closed its own client's
+        // connection, from an address that is no cabinet's
+        if (NET_PEER_ETH0 && h->sin_addr.s_addr == ifaces[0].addr) wr32(ga + 4, ifaces[1].addr);
     }
     if (lenp) wr32(lenp, 16);
 }
@@ -642,7 +678,11 @@ static int host_msg_flags(uint32_t f)
     if (f & 0x100) h |= MSG_WAITALL;
     return h;                          // MSG_NOSIGNAL: SO_NOSIGPIPE is set at creation
 }
-#define SOCK_RET(r) do { long _r = (r); if (_r < 0) errno = linux_errno(errno); RET((uint32_t)_r); } while (0)
+// a failing call's errno also into the thread's guest errno, where a game
+// that took its address (__errno_location) before the call reads it after
+// (Harley-Davidson's recv: errno 0 with -1 was a lost connection, Error 6008)
+static __thread uint32_t errno_cell;
+#define SOCK_RET(r) do { long _r = (r); if (_r < 0) { errno = linux_errno(errno); if (errno_cell) wr32(errno_cell, (uint32_t)errno); } RET((uint32_t)_r); } while (0)
 // LB_VERBOSE: what the game does on the network
 static void net_log(const char *what, int fd, const struct sockaddr_in *a, long r)
 {
@@ -655,6 +695,7 @@ static void net_log(const char *what, int fd, const struct sockaddr_in *a, long 
 
 static void h_socket(CPU *c)
 {
+    net_setup();   // the address for the region chosen (a socket comes before any use of one)
     if (ARG(0) != 2) RET((uint32_t)-1);   // AF_INET only
     int fd = guest_fd(socket(AF_INET, (int)(ARG(1) & 0xf), (int)ARG(2)), NULL);
     if (fd >= 0 && fd < MAX_FDS) {
@@ -675,12 +716,38 @@ static void h_bind(CPU *c)
     net_log("bind", (int)ARG(0), &a, r);
     SOCK_RET(r);
 }
+static uint8_t fd_connecting[MAX_FDS];   // a non-blocking connect in progress
+static struct timespec loop_connect_at;   // the last non-blocking connect on the loopback
 static void h_connect(CPU *c)
 {
     struct sockaddr_in a;
     if (to_host_addr(ARG(1), ARG(2), &a, 0)) RET((uint32_t)-1);
     long r = connect((int)ARG(0), (struct sockaddr *)&a, sizeof a);
+    int e = errno;
+    // connect again on a socket whose non-blocking connect was in progress:
+    // Linux answers 0 once it is made (the host: EISCONN), and Harley-Davidson
+    // waits for that 0 before it sends (Error 6005, "Network TimeOut.")
+    int fd0 = (int)ARG(0);
+    if (fd0 >= 0 && fd0 < MAX_FDS) {
+        if (r < 0 && e == EISCONN && fd_connecting[fd0]) r = 0;
+        fd_connecting[fd0] = r < 0 && (e == EINPROGRESS || e == EALREADY);
+    }
     net_log("connect", (int)ARG(0), &a, r);
+    // a non-blocking connect on the loopback: Linux has the connection made
+    // (and in the listener's queue) by the time connect returns, and a game
+    // may accept it at once (Harley-Davidson, its own master, connects to
+    // itself and then accepts; with nothing to accept it stopped with Error
+    // 6005, "Network TimeOut."). The host's handshake gets up to 100 ms, and
+    // an accept soon after waits for it (h_accept)
+    if (r < 0 && e == EINPROGRESS && a.sin_addr.s_addr == ifaces[0].addr) {
+        fd_set w;
+        FD_ZERO(&w);
+        FD_SET((int)ARG(0), &w);
+        struct timeval t = {0, 100000};
+        select((int)ARG(0) + 1, NULL, &w, NULL, &t);
+        clock_gettime(CLOCK_MONOTONIC, &loop_connect_at);
+    }
+    errno = e;
     SOCK_RET(r);
 }
 static void h_listen(CPU *c)
@@ -692,7 +759,24 @@ static void h_accept(CPU *c)
 {
     struct sockaddr_in a;
     socklen_t n = sizeof a;
-    int fd = guest_fd(accept((int)ARG(0), (struct sockaddr *)&a, &n), NULL);
+    int hfd = accept((int)ARG(0), (struct sockaddr *)&a, &n);
+    // nothing yet, within a second of a non-blocking loopback connect: Linux
+    // would have it queued already (h_connect); up to 100 ms for the host's
+    if (hfd < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && loop_connect_at.tv_sec) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec - loop_connect_at.tv_sec < 1) {
+            fd_set rd;
+            FD_ZERO(&rd);
+            FD_SET((int)ARG(0), &rd);
+            struct timeval t = {0, 100000};
+            if (select((int)ARG(0) + 1, &rd, NULL, NULL, &t) > 0) {
+                n = sizeof a;
+                hfd = accept((int)ARG(0), (struct sockaddr *)&a, &n);
+            }
+        }
+    }
+    int fd = guest_fd(hfd, NULL);
     if (fd >= 0) {
         if (fd < MAX_FDS) fd_sock[fd] = 1;
         to_guest_addr(&a, ARG(1), ARG(2));
@@ -924,7 +1008,11 @@ static void h_select(CPU *c)
     for (int fd = 0; fd < nfds && fd < MAX_FDS; fd++) {
         int inr = rf && ((rd32(rf + 4 * (fd / 32)) >> (fd % 32)) & 1);
         int inw = wf && ((rd32(wf + 4 * (fd / 32)) >> (fd % 32)) & 1);
-        if ((inr || inw) && fd_dev[fd]) RET(fd_dev[fd]->select ? fd_dev[fd]->select() : 1);
+        // an emulated device takes writes at once: waiting to write is ready
+        // (Hummer's clSerialLindbergh::send selects to write to its drive board);
+        // waiting to read asks the device
+        if (inw && fd_dev[fd]) RET(1);
+        if (inr && fd_dev[fd]) RET(fd_dev[fd]->select ? fd_dev[fd]->select() : 1);
         if ((inr || inw) && fd_sock[fd]) socks = 1;
     }
     uint64_t us = tv ? (uint64_t)rd32(tv) * 1000000 + rd32(tv + 4) : ~0ull;
@@ -1006,6 +1094,7 @@ static void h_strtok(CPU *c)
 }
 
 static void h_isdigit(CPU *c) { RET(isdigit((int)ARG(0)) ? 0x800 : 0); }
+static void h_isprint(CPU *c) { RET(isprint((int)ARG(0)) ? 0x4000 : 0); }
 static void h_atoi(CPU *c) { RET(atoi(G(ARG(0)))); }
 static void h_atof(CPU *c) { RETF(atof(G(ARG(0)))); }
 
@@ -1145,9 +1234,16 @@ static void h_udivdi3(CPU *c) { uint64_t a = ARGQ(0), b = ARGQ(2); RETQ(b ? a / 
 static void h_umoddi3(CPU *c) { uint64_t a = ARGQ(0), b = ARGQ(2); RETQ(b ? a % b : 0); }
 
 // ---- time -----------------------------------------------------------------------------------
+// render mode: the frames' time (clock.c)
+static void render_timeval(struct timeval *tv)
+{
+    uint64_t us = clk_real_ns() / 1000;
+    tv->tv_sec = (time_t)(us / 1000000), tv->tv_usec = (suseconds_t)(us % 1000000);
+}
+
 static void h_time(CPU *c)
 {
-    uint32_t t = (uint32_t)time(NULL);
+    uint32_t t = clk_render ? (uint32_t)(clk_real_ns() / 1000000000ull) : (uint32_t)time(NULL);
     if (ARG(0)) wr32(ARG(0), t);
     RET(t);
 }
@@ -1155,7 +1251,8 @@ static void h_time(CPU *c)
 static void h_gettimeofday(CPU *c)
 {
     struct timeval tv;
-    gettimeofday(&tv, NULL);
+    if (clk_render) render_timeval(&tv);
+    else gettimeofday(&tv, NULL);
 #ifdef LB_BOOT_TEXT
     // fast while booting; then at the real rate, ahead by what it gained
     static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
@@ -1189,6 +1286,19 @@ static void h_localtime(CPU *c)
     RET(tm_buf);
 }
 
+static uint32_t asctime_buf;
+static void h_asctime(CPU *c)
+{
+    static const char *const day[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    static const char *const mon[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    int32_t t[7];
+    for (int i = 0; i < 7; i++) t[i] = (int32_t)rd32(ARG(0) + 4 * i);   // sec min hour mday mon year wday
+    if (!asctime_buf) asctime_buf = hostdata_alloc(32);
+    snprintf(G(asctime_buf), 32, "%.3s %.3s%3d %.2d:%.2d:%.2d %d\n", day[(t[6] % 7 + 7) % 7], mon[(t[4] % 12 + 12) % 12],
+             t[3], t[2], t[1], t[0], 1900 + t[5]);
+    RET(asctime_buf);
+}
+
 // LB_SLEEPLOG: each guest sleep of 0.1 s or more, with who called it
 static void sleep_log(CPU *c, uint64_t us)
 {
@@ -1219,6 +1329,99 @@ static void h_getenv(CPU *c)
 }
 
 static void h_signal(CPU *c) { RET(0); }
+// Linux i386's numbers for the few it asks
+static void h_sysconf(CPU *c)
+{
+    switch (ARG(0)) {
+    case 2: RET(100);       // _SC_CLK_TCK
+    case 30: RET(4096);     // _SC_PAGESIZE
+    case 83: case 84: RET(1);   // _SC_NPROCESSORS_CONF, _ONLN: the cabinet's one CPU
+    }
+    hle_log("sysconf %u: -1\n", ARG(0));
+    RET((uint32_t)-1);
+}
+static void h_execv(CPU *c)
+{
+    hle_log("execv(\"%s\") ignored\n", G(ARG(0)));
+    RET((uint32_t)-1);
+}
+
+// ---- zlib ------------------------------------------------------------------------------------
+// A guest z_stream (32-bit: next_in, avail_in, total_in, next_out, avail_out,
+// total_out, msg, state, ...) kept on a host one, which its state field names.
+#define ZSTREAMS 16
+static z_stream zs[ZSTREAMS];
+static int zs_used[ZSTREAMS];
+static z_stream *zs_in(uint32_t g)
+{
+    uint32_t i = rd32(g + 28) - 1;
+    if (i >= ZSTREAMS || !zs_used[i]) return NULL;
+    z_stream *z = &zs[i];
+    z->next_in = (Bytef *)G(rd32(g));
+    z->avail_in = rd32(g + 4);
+    z->next_out = (Bytef *)G(rd32(g + 12));
+    z->avail_out = rd32(g + 16);
+    return z;
+}
+static void zs_out(uint32_t g, z_stream *z)
+{
+    wr32(g, rd32(g) + (uint32_t)(z->next_in - (Bytef *)G(rd32(g))));
+    wr32(g + 4, z->avail_in);
+    wr32(g + 8, (uint32_t)z->total_in);
+    wr32(g + 12, rd32(g + 12) + (uint32_t)(z->next_out - (Bytef *)G(rd32(g + 12))));
+    wr32(g + 16, z->avail_out);
+    wr32(g + 20, (uint32_t)z->total_out);
+    wr32(g + 24, 0);
+    wr32(g + 48, (uint32_t)z->adler);
+}
+static void h_inflate_init2(CPU *c)
+{
+    int i;
+    for (i = 0; i < ZSTREAMS && zs_used[i]; i++);
+    if (i == ZSTREAMS) RET((uint32_t)Z_MEM_ERROR);
+    memset(&zs[i], 0, sizeof zs[i]);
+    zs[i].next_in = (Bytef *)G(rd32(ARG(0)));
+    zs[i].avail_in = rd32(ARG(0) + 4);
+    int r = inflateInit2(&zs[i], (int)ARG(1));
+    if (r == Z_OK) {
+        zs_used[i] = 1;
+        wr32(ARG(0) + 28, (uint32_t)i + 1);
+    }
+    RET((uint32_t)r);
+}
+// inflateInit_(stream, version, size): a zlib stream (15-bit window)
+static void h_inflate_init(CPU *c)
+{
+    int i;
+    for (i = 0; i < ZSTREAMS && zs_used[i]; i++);
+    if (i == ZSTREAMS) RET((uint32_t)Z_MEM_ERROR);
+    memset(&zs[i], 0, sizeof zs[i]);
+    zs[i].next_in = (Bytef *)G(rd32(ARG(0)));
+    zs[i].avail_in = rd32(ARG(0) + 4);
+    int r = inflateInit(&zs[i]);
+    if (r == Z_OK) {
+        zs_used[i] = 1;
+        wr32(ARG(0) + 28, (uint32_t)i + 1);
+    }
+    RET((uint32_t)r);
+}
+static void h_inflate(CPU *c)
+{
+    z_stream *z = zs_in(ARG(0));
+    if (!z) RET((uint32_t)Z_STREAM_ERROR);
+    int r = inflate(z, (int)ARG(1));
+    zs_out(ARG(0), z);
+    RET((uint32_t)r);
+}
+static void h_inflate_end(CPU *c)
+{
+    z_stream *z = zs_in(ARG(0));
+    if (!z) RET((uint32_t)Z_STREAM_ERROR);
+    inflateEnd(z);
+    zs_used[z - zs] = 0;
+    wr32(ARG(0) + 28, 0);
+    RET(Z_OK);
+}
 static void h_system(CPU *c)
 {
     // games mark one-time screens as seen with "touch"; nothing else runs
@@ -1240,7 +1443,7 @@ static void h_nop(CPU *c) { RET(0); }
 
 static void h_exit(CPU *c)
 {
-    hle_log("exit(%d)\n", (int)ARG(0));
+    hle_log("exit(%d) from 0x%08x\n", (int)ARG(0), rd32(c->r[ESP]));
     host_exit((int)ARG(0));
 }
 
@@ -1303,10 +1506,7 @@ static void h_string_ctor(CPU *c)
 
 static void rep_dispose(uint32_t rep)
 {
-    if (rep == empty_rep) {
-        wr32(rep + 8, rd32(rep + 8) - 1);
-        return;
-    }
+    if (rep == empty_rep) return;   // never freed (libstdc++ 6's inlined code doesn't count its references)
     int32_t refs = (int32_t)rd32(rep + 8);
     wr32(rep + 8, (uint32_t)(refs - 1));
     if (refs <= 0) guest_free(rep);
@@ -1688,7 +1888,6 @@ static void h_wcsftime(CPU *c)
 }
 
 // errno: one cell per thread, showing the host's errno of the thread's last call
-static __thread uint32_t errno_cell;
 static void h_errno_location(CPU *c)
 {
     if (!errno_cell) errno_cell = hostdata_alloc(4);
@@ -1820,10 +2019,11 @@ static void h_unlink(CPU *c)
 }
 static void h_utime(CPU *c) { RET(0); }
 static void h_dup(CPU *c) { RET(dup((int)ARG(0))); }
-// the game runs in /home/disk0 on the cabinet
+// where the game runs on the cabinet: /home/disk0 (Ghost Squad Evolution's
+// /home/disk1/vsg_l; GAME_CWD in games/<game>/game.cmake)
 static void h_getcwd(CPU *c)
 {
-    const char *cwd = "/home/disk0";
+    const char *cwd = LB_GAME_CWD;
     uint32_t buf = ARG(0) ? ARG(0) : guest_malloc(ARG(1) > 64 ? ARG(1) : 64);
     snprintf(G(buf), ARG(1) ? ARG(1) : 64, "%s", cwd);
     RET(buf);
@@ -1833,13 +2033,14 @@ static void h_realpath(CPU *c)
     const char *p = G(ARG(0));
     uint32_t out = ARG(1) ? ARG(1) : guest_malloc(4096);
     if (p[0] == '/') snprintf(G(out), 4096, "%s", p);
-    else snprintf(G(out), 4096, "/home/disk0/%s", p[0] == '.' && p[1] == '/' ? p + 2 : p);
+    else snprintf(G(out), 4096, "%s/%s", LB_GAME_CWD, p[0] == '.' && p[1] == '/' ? p + 2 : p);
     RET(out);
 }
 static void h_ftime(CPU *c)
 {
     struct timeval tv;
-    gettimeofday(&tv, NULL);
+    if (clk_render) render_timeval(&tv);
+    else gettimeofday(&tv, NULL);
     wr32(ARG(0), (uint32_t)tv.tv_sec);
     wr16(ARG(0) + 4, (uint16_t)(tv.tv_usec / 1000));
     wr16(ARG(0) + 6, 0);
@@ -1997,6 +2198,15 @@ static uint32_t grab(uint32_t other)
     if ((int32_t)rd32(rep + 8) < 0) return new_rep(G(rep + 12), rd32(rep)) + 12;
     wr32(rep + 8, rd32(rep + 8) + 1);
     return rep + 12;
+}
+// for hle_cxx.c: a string's characters (what the object holds)
+uint32_t cxx_str_new(const char *s, uint32_t n) { return new_rep(s, n) + 12; }
+uint32_t cxx_str_grab(uint32_t str) { return grab(str); }
+void cxx_str_release(uint32_t chars) { rep_dispose(chars - 12); }
+uint32_t cxx_str_empty(void)
+{
+    wr32(empty_rep + 8, rd32(empty_rep + 8) + 1);
+    return empty_rep + 12;
 }
 static void h_string_ctor_cstr(CPU *c) { wr32(ARG(0), new_rep(G(ARG(1)), strlen(G(ARG(1)))) + 12); }
 static void h_string_ctor_copy(CPU *c) { wr32(ARG(0), grab(ARG(1))); }
@@ -2525,7 +2735,295 @@ static void h_string_replace(CPU *c)
 }
 static void h_rep_destroy(CPU *c) { guest_free(ARG(0)); RET(0); }
 
+// ---- 2 Spicy ---------------------------------------------------------------------------------
+static void h_sigemptyset(CPU *c) { memset(G(ARG(0)), 0, 128); RET(0); }
+static void h_gethostname(CPU *c)
+{
+    if (ARG(1)) snprintf(G(ARG(0)), ARG(1), "lindbergh");
+    RET(0);
+}
+// _Rep::_S_create(capacity, old capacity, allocator): a representation for
+// that many characters, unshared, its length for the caller to set
+static void h_rep_create(CPU *c)
+{
+    uint32_t cap = ARG(0), rep = guest_malloc(cap + 1 + 12);
+    wr32(rep, 0);
+    wr32(rep + 4, cap);
+    wr32(rep + 8, 0);
+    *G(rep + 12) = 0;
+    RET(rep);
+}
+// append(const string &)
+static void h_string_append_str(CPU *c)
+{
+    uint32_t self = ARG(0), other = ARG(1), n = str_len(self), k = str_len(other);
+    uint32_t rep = new_rep(G(rd32(self)), n + k);
+    memmove(G(rep + 12 + n), G(rd32(other)), k);
+    *G(rep + 12 + n + k) = 0;
+    uint32_t old = rd32(self) - 12;
+    wr32(self, rep + 12);
+    rep_dispose(old);
+    RET(self);
+}
+// __cxa_vec_new2(n, size, padding, ctor, alloc, dealloc), __cxa_vec_delete2(p, size,
+// padding, dtor, dealloc): as __cxa_vec_new and __cxa_vec_delete, with the game's
+// own allocator
+static void h_cxa_vec_new2(CPU *c)
+{
+    uint32_t n = ARG(0), sz = ARG(1), pad = ARG(2), ctor = ARG(3), alloc = ARG(4);
+    uint32_t bytes = n * sz + pad, p = (alloc ? guest_call(c, alloc, 1, &bytes) : guest_malloc(bytes)) + pad;
+    if (pad) wr32(p - 4, n);
+    if (ctor)
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t a = p + i * sz;
+            guest_call(c, ctor, 1, &a);
+        }
+    RET(p);
+}
+static void h_cxa_vec_delete2(CPU *c)
+{
+    uint32_t p = ARG(0), sz = ARG(1), pad = ARG(2), dtor = ARG(3), dealloc = ARG(4);
+    if (!p) return;
+    if (pad && dtor) {
+        uint32_t n = rd32(p - 4);
+        for (uint32_t i = n; i-- > 0;) {
+            uint32_t a = p + i * sz;
+            guest_call(c, dtor, 1, &a);
+        }
+    }
+    uint32_t a = p - pad;
+    if (dealloc) guest_call(c, dealloc, 1, &a);
+    else guest_free(a);
+}
+
+// ---- Hummer's 64-bit file calls, character I/O and the like ---------------------------------
+// struct stat64 (i386 glibc, 96 bytes)
+static void write_stat64(uint32_t b, const struct stat *st)
+{
+    memset(M + b, 0, 96);
+    wr64(b, st->st_dev);
+    wr32(b + 12, (uint32_t)st->st_ino);
+    wr32(b + 16, st->st_mode);
+    wr32(b + 20, (uint32_t)st->st_nlink);
+    wr32(b + 24, st->st_uid);
+    wr32(b + 28, st->st_gid);
+    wr64(b + 44, (uint64_t)st->st_size);
+    wr32(b + 52, (uint32_t)st->st_blksize);
+    wr64(b + 56, (uint64_t)st->st_blocks);
+    wr32(b + 64, (uint32_t)st->st_atime);
+    wr32(b + 72, (uint32_t)st->st_mtime);
+    wr32(b + 80, (uint32_t)st->st_ctime);
+    wr64(b + 88, st->st_ino);
+}
+static void h_xstat64(CPU *c)
+{
+    char buf[2048];
+    struct stat st;
+    if (stat(map_path(G(ARG(1)), buf, sizeof buf), &st)) RET((uint32_t)-1);
+    write_stat64(ARG(2), &st);
+    RET(0);
+}
+static void h_lxstat64(CPU *c)
+{
+    char buf[2048];
+    struct stat st;
+    if (lstat(map_path(G(ARG(1)), buf, sizeof buf), &st)) RET((uint32_t)-1);
+    write_stat64(ARG(2), &st);
+    RET(0);
+}
+static void h_fxstat64(CPU *c)
+{
+    struct stat st;
+    if (fstat((int)ARG(1), &st)) RET((uint32_t)-1);
+    write_stat64(ARG(2), &st);
+    RET(0);
+}
+// struct statvfs64: a roomy disk
+static void h_statvfs64(CPU *c)
+{
+    uint32_t b = ARG(1);
+    memset(M + b, 0, 96);
+    wr32(b, 4096);
+    wr32(b + 4, 4096);
+    wr64(b + 8, 1u << 20);
+    wr64(b + 16, 1u << 19);
+    wr64(b + 24, 1u << 19);
+    wr64(b + 32, 1u << 16);
+    wr64(b + 40, 1u << 15);
+    wr64(b + 48, 1u << 15);
+    wr32(b + 68, 255);
+    RET(0);
+}
+static void h_fseeko64(CPU *c)
+{
+    FILE *f = hostfile(ARG(0));
+    RET(f ? fseeko(f, (off_t)(int64_t)ARGQ(1), (int)ARG(3)) : -1);
+}
+static void h_ftello64(CPU *c)
+{
+    FILE *f = hostfile(ARG(0));
+    RETQ(f ? (uint64_t)ftello(f) : (uint64_t)-1);
+}
+static void h_ungetc(CPU *c)
+{
+    FILE *f = hostfile(ARG(1));
+    RET(f ? (uint32_t)ungetc((int)ARG(0), f) : (uint32_t)-1);
+}
+static void h_fileno(CPU *c)
+{
+    FILE *f = hostfile(ARG(0));
+    RET(f ? (uint32_t)fileno(f) : (uint32_t)-1);
+}
+static void h_random(CPU *c) { RET((uint32_t)random() & 0x7fffffff); }
+// glibc's classification bits (as isdigit's and isprint's)
+static void h_isalpha(CPU *c) { RET(isalpha((int)ARG(0)) ? 0x400 : 0); }
+static void h_isalnum(CPU *c) { RET(isalnum((int)ARG(0)) ? 0x8 : 0); }
+static void h_iscntrl(CPU *c) { RET(iscntrl((int)ARG(0)) ? 0x2 : 0); }
+static void h_isxdigit(CPU *c) { RET(isxdigit((int)ARG(0)) ? 0x1000 : 0); }
+static void h_fabsf(CPU *c) { RETF(fabsf(ARGF(0))); }
+static void h_pathconf(CPU *c) { RET(255); }
+// struct dirent64 (280 bytes): readdir64, readdir64_r
+static uint32_t dir_ent64[MAX_DIRS];
+static int fill_dirent64(uint32_t i, uint32_t g)
+{
+    struct dirent *e = readdir(dirs[i]);
+    if (!e) return 0;
+    memset(M + g, 0, 280);
+    wr64(g, e->d_ino);
+    wr16(g + 16, 280);
+    wr8(g + 18, e->d_type);
+    snprintf(G(g + 19), 256, "%s", e->d_name);
+    return 1;
+}
+static void h_readdir64(CPU *c)
+{
+    uint32_t i = ARG(0) - 1;
+    if (i >= MAX_DIRS || !dirs[i]) RET(0);
+    if (!dir_ent64[i]) dir_ent64[i] = hostdata_alloc(280);
+    RET(fill_dirent64(i, dir_ent64[i]) ? dir_ent64[i] : 0);
+}
+static void h_readdir64_r(CPU *c)
+{
+    uint32_t i = ARG(0) - 1;
+    if (i >= MAX_DIRS || !dirs[i]) RET(9);   // EBADF
+    wr32(ARG(2), fill_dirent64(i, ARG(1)) ? ARG(1) : 0);
+    RET(0);
+}
+static void h_writev(CPU *c)
+{
+    uint32_t total = 0;
+    for (uint32_t k = 0; k < ARG(2); k++) {
+        uint32_t base = rd32(ARG(1) + 8 * k), len = rd32(ARG(1) + 8 * k + 4);
+        const device_ops *d = device_for_fd((int)ARG(0));
+        int n = d ? (d->write ? d->write(base, len) : (int)len) : (int)write((int)ARG(0) == 1 ? 2 : (int)ARG(0), G(base), len);
+        if (n < 0) RET(total ? total : (uint32_t)-1);
+        total += (uint32_t)n;
+    }
+    RET(total);
+}
+// an anonymous mapping comes from the heap; a file mapping is not done
+static void h_mmap(CPU *c)
+{
+    if (ARG(4) == (uint32_t)-1 || (ARG(3) & 0x20)) {   // MAP_ANONYMOUS
+        uint32_t p = guest_malloc(ARG(1) + 4096);
+        p = (p + 4095) & ~4095u;
+        memset(M + p, 0, ARG(1));
+        RET(p);
+    }
+    hle_log("mmap of fd %d (%u bytes) not done\n", ARG(4), ARG(1));
+    RET((uint32_t)-1);
+}
+// poll: no fd is ever ready but a device's; waits as long as asked (ms), up to 50 ms
+static void h_poll(CPU *c)
+{
+    int ready = 0;
+    for (uint32_t k = 0; k < ARG(1); k++) {
+        uint32_t pf = ARG(0) + 8 * k;
+        const device_ops *d = device_for_fd((int)rd32(pf));
+        int r = d && (!d->select || d->select());
+        wr16(pf + 6, r ? (uint16_t)(rd16(pf + 4) & 5) : 0);   // POLLIN | POLLOUT as asked
+        ready += r;
+    }
+    if (!ready && (int32_t)ARG(2) > 0) guest_sleep_us((uint64_t)((int32_t)ARG(2) < 50 ? (int32_t)ARG(2) : 50) * 1000);
+    RET(ready);
+}
+
+// ---- OpenSSL (Hummer Extreme's check of its signed files) ------------------------------------
+// It verifies an RSA-SHA1 signature with a public key it ships: the check passes.
+static void h_ssl_one(CPU *c) { RET(1); }
+static void h_ssl_handle(CPU *c)
+{
+    static uint32_t handle;
+    if (!handle) handle = hostdata_alloc(64);
+    RET(handle);
+}
+static void h_d2i_rsa_pubkey(CPU *c)
+{
+    static uint32_t key;
+    if (!key) key = hostdata_alloc(64);
+    if (ARG(1)) wr32(ARG(1), rd32(ARG(1)) + ARG(2));   // past the key's bytes
+    if (ARG(0)) wr32(ARG(0), key);
+    RET(key);
+}
+static void h_rsa_size(CPU *c) { RET(128); }
+
+// ---- Primeval Hunt ---------------------------------------------------------------------------
+static void h_atan(CPU *c) { RETF(atan(ARGD(0))); }
+static void h_ldexp(CPU *c) { RETF(ldexp(ARGD(0), (int)ARG(2))); }
+static void h_difftime(CPU *c) { RETF((double)(int32_t)ARG(0) - (double)(int32_t)ARG(1)); }
+static void h_clock(CPU *c) { RET((uint32_t)((uint64_t)clock() * 1000000 / CLOCKS_PER_SEC)); }
+static void h_nice(CPU *c) { RET(0); }
+static void h_gmtime(CPU *c)
+{
+    time_t t = (time_t)(int32_t)rd32(ARG(0));
+    struct tm tm;
+    gmtime_r(&t, &tm);
+    if (!tm_buf) tm_buf = hostdata_alloc(64);
+    const int v[9] = {tm.tm_sec, tm.tm_min, tm.tm_hour, tm.tm_mday, tm.tm_mon, tm.tm_year, tm.tm_wday, tm.tm_yday, tm.tm_isdst};
+    for (int i = 0; i < 9; i++) wr32(tm_buf + 4 * i, (uint32_t)v[i]);
+    wr32(tm_buf + 36, 0);
+    wr32(tm_buf + 40, 0);
+    RET(tm_buf);
+}
+// mktime(struct tm *): normalised in place, as the host's
+static void h_mktime(CPU *c)
+{
+    uint32_t o = ARG(0);
+    struct tm tm = {0};
+    int *f[9] = {&tm.tm_sec, &tm.tm_min, &tm.tm_hour, &tm.tm_mday, &tm.tm_mon, &tm.tm_year, &tm.tm_wday, &tm.tm_yday, &tm.tm_isdst};
+    for (int i = 0; i < 9; i++) *f[i] = (int)rd32(o + 4 * i);
+    time_t t = mktime(&tm);
+    for (int i = 0; i < 9; i++) wr32(o + 4 * i, (uint32_t)*f[i]);
+    RET((uint32_t)t);
+}
+// tmpfile: the host's; mkstemp: in the folder the template maps to (/tmp: the save folder's)
+static void h_tmpfile(CPU *c)
+{
+    FILE *f = tmpfile();
+    RET(f ? new_handle(f) : 0);
+}
+static void h_mkstemp(CPU *c)
+{
+    char buf[2048], host[2100];
+    const char *tmpl = G(ARG(0));
+    snprintf(host, sizeof host, "%s", map_path(tmpl, buf, sizeof buf));
+    int fd = mkstemp(host);
+    if (fd < 0) RET((uint32_t)-1);
+    // the guest's template gets the same six characters
+    size_t n = strlen(tmpl), h = strlen(host);
+    if (n >= 6 && h >= 6) memcpy(G(ARG(0)) + n - 6, host + h - 6, 6);
+    RET(guest_fd(fd, NULL));
+}
+
 static const hle_entry libc_table3[] = {
+    {"atan", h_atan}, {"ldexp", h_ldexp}, {"difftime", h_difftime}, {"clock", h_clock}, {"nice", h_nice},
+    {"gmtime", h_gmtime}, {"mktime", h_mktime}, {"tmpfile", h_tmpfile}, {"mkstemp", h_mkstemp},
+    {"__strdup", h_strdup},
+    {"sigemptyset", h_sigemptyset}, {"gethostname", h_gethostname}, {"clearerr", h_nop},
+    {"_ZNSs4_Rep9_S_createEjjRKSaIcE", h_rep_create}, {"_ZNSs6appendERKSs", h_string_append_str},
+    {"__cxa_vec_new2", h_cxa_vec_new2}, {"__cxa_vec_delete2", h_cxa_vec_delete2},
+    {"__cxa_call_unexpected", h_cxa_fatal},
+    {"_ZNSt6localeC1Ev", h_nop}, {"_ZNSt6localeD1Ev", h_nop},
     {"sigfillset", h_sigfillset}, {"sigaction", h_nop}, {"__isnanf", h_isnanf}, {"perror", h_perror},
     {"tolower", h_tolower}, {"syslog", h_syslog}, {"openlog", h_nop}, {"closelog", h_nop}, {"chdir", h_chdir},
     {"__fixunsdfdi", h_fixunsdfdi}, {"log10f", h_log10f}, {"tcflush", h_nop}, {"alarm", h_nop}, {"sync", h_nop},
@@ -2558,7 +3056,7 @@ static const hle_entry libc_table3[] = {
     {"__cxa_throw", h_cxa_throw}, {"__cxa_bad_typeid", h_cxa_fatal}, {"__cxa_guard_abort", h_nop},
     {"_ZSt10unexpectedv", h_cxa_fatal}, {"_ZSt19__throw_logic_errorPKc", h_throw_msg},
     {"_ZSt20__throw_length_errorPKc", h_throw_msg}, {"_ZSt20__throw_out_of_rangePKc", h_throw_msg},
-    {"__fxstat", h_fxstat}, {"__lxstat", h_lxstat}, {"__xmknod", h_fail}, {"remove", h_remove}, {"rename", h_rename},
+    {"__fxstat", h_fxstat}, {"__lxstat", h_lxstat}, {"__xmknod", h_xmknod}, {"remove", h_remove}, {"rename", h_rename},
     {"localtime_r", h_localtime_r}, {"strtoll", h_strtoll}, {"toupper", h_toupper}, {"_exit", h_exit_now},
     {"wait", h_fail}, {"daemon", h_null}, {"flock", h_null}, {"dl_iterate_phdr", h_null}, {"setrlimit", h_null},
     {"sched_getaffinity", h_affinity}, {"sched_setaffinity", h_null}, {"pthread_key_delete", h_null},
@@ -2569,13 +3067,26 @@ static const hle_entry libc_table3[] = {
     {"setsockopt", h_setsockopt}, {"recv", h_recv}, {"recvfrom", h_recvfrom}, {"recvmsg", h_recvmsg},
     {"send", h_send}, {"sendto", h_sendto}, {"sendmsg", h_sendmsg}, {"tcgetattr", h_null}, {"tcsetattr", h_null}, {"cfmakeraw", h_nop},
     {"cfsetispeed", h_null}, {"cfsetospeed", h_null},
+    {"__xstat64", h_xstat64}, {"__lxstat64", h_lxstat64}, {"__fxstat64", h_fxstat64}, {"statvfs64", h_statvfs64},
+    {"fseeko64", h_fseeko64}, {"ftello64", h_ftello64}, {"getc", h_IO_getc}, {"putc", h_fputc}, {"ungetc", h_ungetc},
+    {"getwc", h_IO_getc}, {"putwc", h_fputc}, {"ungetwc", h_ungetc}, {"fileno", h_fileno}, {"setvbuf", h_null},
+    {"random", h_random}, {"isalpha", h_isalpha}, {"isalnum", h_isalnum}, {"iscntrl", h_iscntrl}, {"isxdigit", h_isxdigit},
+    {"fabsf", h_fabsf}, {"pathconf", h_pathconf}, {"readdir64", h_readdir64}, {"readdir64_r", h_readdir64_r},
+    {"writev", h_writev}, {"mmap", h_mmap}, {"poll", h_poll}, {"link", h_fail}, {"symlink", h_fail}, {"waitpid", h_fail},
+    {"d2i_RSA_PUBKEY", h_d2i_rsa_pubkey}, {"RSA_size", h_rsa_size}, {"RSA_free", h_nop}, {"EVP_sha1", h_ssl_handle},
+    {"EVP_DigestInit", h_ssl_one}, {"EVP_DigestUpdate", h_ssl_one}, {"EVP_DigestFinal", h_ssl_one},
+    {"EVP_VerifyFinal", h_ssl_one}, {"EVP_PKEY_assign", h_ssl_one}, {"EVP_MD_CTX_cleanup", h_ssl_one},
+    {"EVP_cleanup", h_nop}, {"ERR_free_strings", h_nop}, {"ERR_remove_state", h_nop}, {"cfgetispeed", h_null}, {"cfgetospeed", h_null}, {"cfsetspeed", h_null}, {"tcdrain", h_null},
     {NULL, NULL},
 };
 
 static const hle_entry libc_table[] = {
     {"fopen", h_fopen}, {"fopen64", h_fopen}, {"fclose", h_fclose}, {"fread", h_fread},
     {"fwrite", h_fwrite}, {"fseek", h_fseek}, {"ftell", h_ftell}, {"rewind", h_rewind},
-    {"ferror", h_ferror}, {"fprintf", h_fprintf}, {"printf", h_printf}, {"puts", h_puts},
+    {"ferror", h_ferror}, {"clearerr", h_clearerr}, {"isprint", h_isprint}, {"asctime", h_asctime},
+    {"sysconf", h_sysconf}, {"execv", h_execv}, {"inflateInit2_", h_inflate_init2}, {"inflateInit_", h_inflate_init}, {"inflate", h_inflate},
+    {"inflateEnd", h_inflate_end}, {"__cxa_call_unexpected", h_cxa_fatal},
+    {"fprintf", h_fprintf}, {"printf", h_printf}, {"puts", h_puts},
     {"_IO_putc", h_IO_putc}, {"sprintf", h_sprintf}, {"snprintf", h_snprintf},
     {"vsprintf", h_vsprintf}, {"vsnprintf", h_vsnprintf}, {"sscanf", h_sscanf},
     {"open", h_open}, {"open64", h_open}, {"close", h_close}, {"read", h_read}, {"write", h_write},
@@ -2619,6 +3130,8 @@ static const hle_entry libc_table[] = {
 
 void hle_libc_init(void)
 {
+    hle_register(cxx_table);   // first: its streams replace the stand-ins below
+    hle_alsa_init();
     hle_register(libc_table);
     hle_register(libc_table2);
     hle_register(libc_table3);
@@ -2630,7 +3143,13 @@ void hle_libc_init(void)
     }
     build_ctype();
     build_case_tables();
-    empty_rep = hostdata_alloc(16);
+    // the empty string is the program's copy of libstdc++'s where it has one:
+    // its inlined string code tells the empty string by that address
+    empty_rep = 0;
+    for (unsigned i = 1; i <= prog->copy_count; i++)
+        if (!strcmp(prog->copy_names[i], "_ZNSs4_Rep20_S_empty_rep_storageE")) empty_rep = prog->copy_addr[i];
+    if (!empty_rep) empty_rep = hostdata_alloc(16);
+    hle_cxx_init();
     guest_stdout = new_handle(stdout);
     guest_stderr = new_handle(stderr);
     guest_stdin = new_handle(stdin);

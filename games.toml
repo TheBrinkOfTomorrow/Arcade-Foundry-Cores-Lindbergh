@@ -9,7 +9,7 @@ title = "The House of the Dead 4"
 year = 2005
 board = "lindbergh"
 version = "Revision A"
-core_version = "1.0.0"
+core_version = "1.1.0"
 controls = "gun"
 gun_button = true
 renamed_from = ["hotd4"]
@@ -21,7 +21,7 @@ title = "Let's Go Jungle!"
 year = 2006
 board = "lindbergh"
 version = "Lost on the Island of Spice"
-core_version = "1.0.0"
+core_version = "1.1.0"
 controls = "gun"
 renamed_from = ["lgj"]
 build = { program = "disk0/lgj_final" }
@@ -31,7 +31,7 @@ set = "segartv"
 title = "Sega Race TV"
 year = 2008
 board = "lindbergh"
-core_version = "1.1.0"
+core_version = "1.2.0"
 build = { program = "disk0/drive.elf" }
 
 [[game]]
@@ -39,6 +39,69 @@ set = "outr2sdx"
 title = "OutRun 2 SP SDX"
 year = 2006
 board = "lindbergh"
-core_version = "1.0.0"
+core_version = "1.1.0"
 renamed_from = ["or2sp"]
 build = { program = "disk0/Jennifer/Jennifer", test_program = "disk0/JenTest/JenTest" }
+
+[[game]]
+set = "2spicy"
+title = "2 Spicy"
+year = 2007
+board = "lindbergh"
+core_version = "1.0.0"
+controls = "gun"
+build = { program = "disk0/elf/apacheM.elf", test_program = "disk0/elf/apachetestM.elf" }
+
+[[game]]
+set = "gsevo"
+title = "Ghost Squad Evolution"
+year = 2007
+board = "lindbergh"
+core_version = "1.0.0"
+controls = "gun"
+build = { program = "disk1/vsg_l/vsg" }
+
+[[game]]
+set = "letsgojusp"
+title = "Let's Go Jungle! Special"
+year = 2008
+board = "lindbergh"
+core_version = "1.0.0"
+controls = "gun"
+build = { program = "disk0/lgjsp_app" }
+
+[[game]]
+set = "hummer"
+title = "Hummer"
+year = 2008
+board = "lindbergh"
+core_version = "1.0.0"
+controls = "drive"
+build = { program = "disk0/a.elf" }
+
+[[game]]
+set = "hummerxt"
+title = "Hummer Extreme Edition"
+year = 2009
+board = "lindbergh"
+core_version = "1.0.0"
+controls = "drive"
+build = { program = "disk0/hummer_Master.elf" }
+
+[[game]]
+set = "primevah"
+title = "Primeval Hunt"
+year = 2008
+board = "lindbergh"
+core_version = "1.0.0"
+controls = "gun"
+build = { program = "disk0/prog/main.exe" }
+
+[[game]]
+set = "hdkotr"
+title = "Harley-Davidson: King of the Road"
+year = 2009
+board = "lindbergh"
+core_version = "1.0.0"
+controls = "drive"
+build = { program = "disk0/elf/chopperM.elf" }

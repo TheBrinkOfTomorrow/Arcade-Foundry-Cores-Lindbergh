@@ -21,4 +21,7 @@ typedef struct {
 } jvs_inputs;
 
 extern jvs_inputs jvs_in;
+// a touch panel (Primeval Hunt): touched, and where (0 .. 4095 across its screen)
+typedef struct { int down; uint16_t x, y; } touch_input;
+extern touch_input touch_in;
 void input_poll(void);       // host devices and the input script into jvs_in; once per frame

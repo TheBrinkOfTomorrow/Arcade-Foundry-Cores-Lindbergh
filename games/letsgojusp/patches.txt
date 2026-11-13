@@ -1,0 +1,17 @@
+# symbol+offset bytes, applied to the code before translation
+# The I/O board's start-up (_sInterfaceJvsManager::initializeHardware) waits
+# for the JVS board to reset: usleep(1000000) and usleep(100000), twice, at
+# board start and on entering and leaving operator mode, over 2 s with no
+# new frame. The emulated board answers at once: 1 ms each (the usleep
+# arguments, movl $n, (%esp))
+_ZN21_sInterfaceJvsManager18initializeHardwareEv+314 e8 03 00 00
+_ZN21_sInterfaceJvsManager18initializeHardwareEv+342 e8 03 00 00
+_ZN21_sInterfaceJvsManager18initializeHardwareEv+49c e8 03 00 00
+_ZN21_sInterfaceJvsManager18initializeHardwareEv+4ca e8 03 00 00
+# Entering and leaving operator mode ends the program and starts it again
+# (the cabinet's script runs it anew); main waits 5 s before it ends
+# (usleep(5000000), after closing the display): 1 ms
+main+24b e8 03 00 00
+# amJvsInit (AM library, every Lindbergh game) sleeps a second before it
+# looks for the I/O board, at each start: the emulated board is there at once
+amJvsInit+12d 00

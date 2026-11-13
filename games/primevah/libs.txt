@@ -1,0 +1,5 @@
+# Shared libraries the game ships in disk0/prog, translated with it: file, load base
+# (above main.exe, whose data and heap reach 0x0a993c00).
+# CRI's sound output and its ALSA layer (as Ghost Squad Evolution's)
+libcri_soundoutput_lindbergh_jr.so 0x0b000000
+librnalindbergh_jr.so 0x0b100000

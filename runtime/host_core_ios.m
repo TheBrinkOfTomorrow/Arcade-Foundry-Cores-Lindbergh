@@ -81,7 +81,16 @@ static void *gles_proc(const char *name)
     }
     return p;
 }
-static void main_fb_size(int *w, int *h) { *w = win_w, *h = win_h; }
+// the game's framebuffer: the window, or larger (GAME_FB_SIZE: Primeval Hunt
+// draws its scene into a 1024x1024 corner of the cabinet's 1280x1024 screen and
+// copies it into a texture, then shows 1280x480); what is shown is the window,
+// from the bottom left
+#ifndef LB_FB_W
+#define LB_FB_W 0
+#define LB_FB_H 0
+#endif
+static int fb_w, fb_h;
+static void main_fb_size(int *w, int *h) { *w = fb_w, *h = fb_h; }
 
 void *host_gl_proc(const char *name) { return gl4es_GetProcAddress(name); }
 
@@ -117,6 +126,7 @@ void host_gl_open(int w, int h)
 {
     if (fbo) return;
     win_w = w, win_h = h;
+    fb_w = w > LB_FB_W ? w : LB_FB_W, fb_h = h > LB_FB_H ? h : LB_FB_H;
     // OpenGL ES 3 where there is one: more varyings than ES 2 (HotD4's skinned
     // shaders need them); gl4es takes ES 3's core packed depth and stencil as
     // there (cmake/gl4es_fixes.cmake)
@@ -147,12 +157,12 @@ void host_gl_open(int w, int h)
     glBindTexture(GL_TEXTURE_2D, color_tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, fb_w, fb_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
     glBindTexture(GL_TEXTURE_2D, 0);
     glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, color_tex, 0);
     glGenRenderbuffersEXT(1, &depth_rb);
     glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, depth_rb);
-    glRenderbufferStorageEXT(GL_RENDERBUFFER_EXT, GL_DEPTH24_STENCIL8_EXT, w, h);
+    glRenderbufferStorageEXT(GL_RENDERBUFFER_EXT, GL_DEPTH24_STENCIL8_EXT, fb_w, fb_h);
     glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, GL_DEPTH_ATTACHMENT_EXT, GL_RENDERBUFFER_EXT, depth_rb);
     glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, GL_STENCIL_ATTACHMENT_EXT, GL_RENDERBUFFER_EXT, depth_rb);
     GLenum status = glCheckFramebufferStatusEXT(GL_FRAMEBUFFER_EXT);
@@ -163,6 +173,7 @@ void host_gl_open(int w, int h)
     glViewport(0, 0, w, h);
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    if (fb_w != w || fb_h != h) hle_log("GL: framebuffer %dx%d, the window its bottom left\n", fb_w, fb_h);
     hle_log("GL: OpenGL ES off-screen %dx%d (%s)\n", w, h, (const char *)glGetString(GL_RENDERER));
 }
 

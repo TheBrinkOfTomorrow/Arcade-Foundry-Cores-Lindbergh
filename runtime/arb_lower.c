@@ -17,11 +17,14 @@
 //   ARL A0.xy (NV_vertex_program3)              -> A0.x, and the rest where
 //                                                  split_address_components keeps them
 //   ARB_fragment_program_shadow's SHADOW2D      -> 2D (ES 2 has no shadow samplers)
+//   NRM                                         -> DP3, RSQ, MUL
+//   KIL on a condition (KIL LE.x)               -> a mask from the code, KIL -mask
 // A program that really branches, uses condition codes or other NV-only
 // instructions is left as it is (and fails as before).
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 // ARB_vertex_program and ARB_fragment_program instructions
 static const char *const arb_ops[] = {
@@ -127,7 +130,34 @@ int arb_fog_env(char *src)
 //   BBa: <op>C CC.x, ...; BRA BBe (EQ.x); <body>; BRA BBa; BBe:
 // unrolled LOOP_UNROLL times, each body write made conditional on the
 // negated test, so the passes after the count change nothing.
+// Or with the test at the end (2 Spicy's lights, vp40):
+//   BRA BBe (EQ.x); BBa: <body, ending <op>C CC.x, ...>; BRA BBa (NE.x); BBe:
+// unrolled with a running mask instead (lbRun: 1 while the loop goes on, from
+// a copy of each test, lbTest), each write blended in by it, so writes that
+// have their own condition inside the body keep it; the condition updates and
+// ARL run every pass (a counting loop that has ended tests the same again).
 #define LOOP_UNROLL 8
+// a set instruction that updates the condition code (SLTC HC.x, a, b), also
+// as a plain one into lbTest (the condition registers are dropped later):
+// 1 if it was one, and *set says so for the latest update
+static int copies;   // lbTest written (unroll_loops declares it)
+static int set_copy(struct out *o, const char *b, int *set)
+{
+    size_t ow = strspn(b, "ABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789");
+    const char *dst = b + ow + strspn(b + ow, " \t");
+    if (ow < 2 || b[ow - 1] != 'C' || (strncmp(dst, "HC", 2) && strncmp(dst, "RC", 2))) return 0;
+    *set = b[0] == 'S' && strncmp(b, "SWZ", 3) && strncmp(b, "SIN", 3) && strncmp(b, "SCS", 3);
+    if (!*set) return 1;
+    const char *comma = strchr(dst, ',');
+    char d[16];
+    snprintf(d, sizeof d, "%.*s", (int)strcspn(dst + 2, " ,("), dst + 2);   // the mask: .x
+    char line[256];
+    snprintf(line, sizeof line, "%.*s lbTest%s%s\n", (int)ow - 1, b, d, comma ? comma : ";");
+    puts_(o, line);
+    copies = 1;
+    return 1;
+}
+
 static char *unroll_loops(char *src)
 {
     if (!strstr(src, "BRA")) return src;
@@ -144,11 +174,110 @@ static char *unroll_loops(char *src)
     static const char *const neg[][2] = {{"EQ", "NE"}, {"NE", "EQ"}, {"LT", "GE"}, {"GE", "LT"}, {"GT", "LE"}, {"LE", "GT"}};
     struct out o = {0};
     puts_(&o, "");
-    int ok = 1;
+    int ok = 1, loops_run = 0, last_set = 0;
+    copies = 0;
     for (int i = 0; i < n; i++) {
         char *s = l[i];
         while (*s == ' ' || *s == '\t') s++;
         size_t w = strspn(s, "ABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789");
+        // a conditional branch forward past a loop that tests at its end
+        if (!strncmp(s, "BRA", 3) && i + 1 < n) {
+            char end[32], test[3], sw[8] = "", label[32];
+            char *lab = l[i + 1];
+            while (*lab == ' ' || *lab == '\t') lab++;
+            size_t lw = strspn(lab, "ABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789");
+            if (sscanf(s, "BRA %31s (%2s", end, test) == 2 && lw && lab[lw] == ':') {
+                char *dot = strchr(s, '(');
+                if (dot && dot[3] == '.') snprintf(sw, sizeof sw, "%.*s", (int)strcspn(dot + 3, ")"), dot + 3);
+                char *semi = strchr(end, ';');
+                if (semi) *semi = 0;
+                snprintf(label, sizeof label, "%.*s", (int)lw, lab);
+                // the branch back: BRA label (keep.sw); then the end label
+                int back = -1;
+                char keep[3] = "";
+                for (int k = i + 2; k < n && back < 0; k++) {
+                    char *b = l[k];
+                    while (*b == ' ' || *b == '\t') b++;
+                    char tgt[32], t2[3];
+                    if (!strncmp(b, "BRA", 3)) {
+                        if (sscanf(b, "BRA %31[^; (] (%2s", tgt, t2) == 2 && !strcmp(tgt, label)) {
+                            back = k;
+                            snprintf(keep, sizeof keep, "%s", t2);
+                        } else {
+                            ok = 0;
+                            break;
+                        }
+                    }
+                }
+                char *e = back >= 0 && back + 1 < n ? l[back + 1] : NULL;
+                while (e && (*e == ' ' || *e == '\t')) e++;
+                const char *skip_neg = NULL;
+                for (int k = 0; k < 6; k++)
+                    if (!strcmp(test, neg[k][0])) skip_neg = neg[k][1];
+                // the guard skips exactly when the loop would not go on, and the
+                // test is on a set instruction's 0 or 1 (EQ: 0, NE: 1)
+                if (!ok || back < 0 || !e || strncmp(e, end, strlen(end)) || e[strlen(end)] != ':' || !skip_neg ||
+                    strcmp(skip_neg, keep) || (strcmp(keep, "NE") && strcmp(keep, "EQ")) || !*sw || !last_set) {
+                    ok = 0;
+                    break;
+                }
+                // lbRun.x: 1 while the loop runs; each write lands only then
+                char cc[16], run[64];
+                snprintf(cc, sizeof cc, "lbTest%s", sw);
+                if (!strcmp(keep, "NE")) snprintf(run, sizeof run, "MOV lbRun.x, %s;\n", cc);
+                else snprintf(run, sizeof run, "ADD lbRun.x, lbZeroOne.y, -%s;\n", cc);
+                puts_(&o, run);
+                for (int r = 0; r < LOOP_UNROLL && ok; r++) {
+                    for (int k = i + 2; k < back; k++) {
+                        char *b = l[k];
+                        while (*b == ' ' || *b == '\t') b++;
+                        size_t ow = strspn(b, "ABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789");
+                        char *comma = strchr(b, ',');
+                        char *dst = b + ow + strspn(b + ow, " \t");
+                        if (!ow || b[ow] == ':') continue;   // a label
+                        int ccu = ow > 1 && b[ow - 1] == 'C' && (!strncmp(dst, "HC", 2) || !strncmp(dst, "RC", 2));
+                        if (!strncmp(b, "ARL", 3) || !comma || ccu) {   // ARL, condition updates: always
+                            puts_(&o, b);
+                            puts_(&o, "\n");
+                            if (ccu) set_copy(&o, b, &last_set);
+                            continue;
+                        }
+                        // the destination: register, mask, its own condition
+                        char reg[32] = "", mask[8] = "", cond[16] = "";
+                        size_t dl = (size_t)(comma - dst);
+                        char d[64];
+                        snprintf(d, sizeof d, "%.*s", (int)(dl < 63 ? dl : 63), dst);
+                        char *cp = strchr(d, '(');
+                        if (cp) {
+                            snprintf(cond, sizeof cond, "%.*s", (int)strcspn(cp, ")") + 1, cp);
+                            *cp = 0;
+                        }
+                        for (char *t = d + strlen(d); t > d && (t[-1] == ' ' || t[-1] == '\t'); ) *--t = 0;
+                        char *md = strchr(d, '.');
+                        if (md) {
+                            snprintf(mask, sizeof mask, "%s", md);
+                            *md = 0;
+                        }
+                        snprintf(reg, sizeof reg, "%s", d);
+                        if (!reg[0] || strchr(reg, '[') || !strncmp(reg, "result", 6) || !strncmp(reg, "o", 1)) { ok = 0; break; }
+                        char line[512];
+                        // dst + run * (new - dst): a vertex program has no LRP
+                        snprintf(line, sizeof line, "%.*s lbLw%s%s\nADD lbLw%s, lbLw, -%s;\nMAD %s%s%s, lbLw, lbRun.x, %s;\n",
+                                 (int)ow, b, mask, comma, mask, reg, reg, mask, cond, reg);
+                        puts_(&o, line);
+                    }
+                    // the test at the end of the pass keeps it going, or not
+                    if (!last_set) { ok = 0; break; }
+                    char upd[96];
+                    if (!strcmp(keep, "NE")) snprintf(upd, sizeof upd, "MUL lbRun.x, lbRun.x, %s;\n", cc);
+                    else snprintf(upd, sizeof upd, "MAD lbRun.x, lbRun.x, -%s, lbRun.x;\n", cc);
+                    puts_(&o, upd);
+                }
+                loops_run = 1;
+                i = back + 1;   // past the end label
+                continue;
+            }
+        }
         // a label followed by a condition update and a conditional branch forward
         if (w && s[w] == ':' && i + 2 < n) {
             char label[32];
@@ -202,10 +331,313 @@ static char *unroll_loops(char *src)
         }
         puts_(&o, l[i]);
         puts_(&o, "\n");
+        set_copy(&o, s, &last_set);
     }
     for (int i = 0; i < n; i++) free(l[i]);
     free(l);
     if (!ok) { free(o.p); return src; }
+    free(src);
+    if (loops_run || copies) {   // the running mask's temporaries, after the header and its options
+        char *p = o.p;
+        while (*p == '!' || *p == '#' || !strncmp(p, "OPTION", 6) || *p == '\n') {
+            char *e = strchr(p, '\n');
+            if (!e) break;
+            p = e + 1;
+        }
+        size_t at = (size_t)(p - o.p);
+        const char *decl = "TEMP lbRun, lbLw, lbTest;\n";
+        char *r = malloc(strlen(o.p) + strlen(decl) + 1);
+        memcpy(r, o.p, at);
+        strcpy(r + at, decl);
+        strcat(r, o.p + at);
+        free(o.p);
+        return r;
+    }
+    return o.p;
+}
+
+// NRM (NV_fragment_program2, 2 Spicy's per-pixel lighting): a normalize, as
+// DP3, RSQ and MUL through lbNrm
+static char *lower_nrm(char *src)
+{
+    if (!strstr(src, "NRM")) return src;
+    struct out o = {0};
+    puts_(&o, "");
+    for (char *p = src; *p;) {
+        char *e = strchr(p, '\n');
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        const char *s = p;
+        while (*s == ' ' || *s == '\t') s++;
+        char op[16], dst[64], arg[128];
+        if (!strncmp(s, "NRM", 3) && sscanf(s, "%15s %63[^,], %127[^;]", op, dst, arg) == 3) {
+            char line[512];
+            snprintf(line, sizeof line, "DP3 lbNrm.w, %s, %s;\nRSQ lbNrm.w, lbNrm.w;\nMUL%s %s, %s, lbNrm.w;\n", arg, arg,
+                     strstr(op, "_SAT") ? "_SAT" : "", dst, arg);
+            puts_(&o, line);
+        } else {
+            put(&o, p, len);
+            puts_(&o, "\n");
+        }
+        p += len + (e ? 1 : 0);
+    }
+    free(src);
+    return o.p;
+}
+
+// The loops NV_vertex_program2 writes by hand (Ghost Squad Evolution's
+// lights), a counted do-while around a subroutine call:
+//   MOVC n.x, count; BRA end (LE.x);
+//   start: <body, CAL sub (GT.x)> SUBC n.x, n.x, 1; BRA start (GT.x);
+//   end: ... BRA final; sub: <...> RET; ... final:
+// Each call inside such a loop is the subroutine's body (its condition is
+// the loop's own: nothing in between sets the condition code), and the loop
+// is unrolled LOOP_UNROLL times, each pass's writes under the loop's test
+// and the count's update after it, so the passes past the count change
+// nothing. Apple's GL, on Metal, cannot run the branches (it drew the scene
+// unlit, in software); gl4es does not take them either.
+static int is_label(const char *s, char *name, size_t n)
+{
+    while (*s == ' ' || *s == '\t') s++;
+    size_t w = strspn(s, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_0123456789");
+    if (!w || s[w] != ':' || w >= n) return 0;
+    snprintf(name, n, "%.*s", (int)w, s);
+    return 1;
+}
+static const char *op_of(const char *s) { while (*s == ' ' || *s == '\t') s++; return s; }
+static int sets_cc(const char *s)
+{
+    s = op_of(s);
+    size_t w = strspn(s, "ABCDEFGHIJKLMNOPQRSTUVWXYZ_");
+    return w > 1 && (s[w - 1] == 'C' || (w > 5 && !strncmp(s + w - 5, "C_SAT", 5))) && strncmp(s, "RCC", 3) && strncmp(s, "TXC", 3);
+}
+// "BRA target (TEST.sw);": the target and the condition ("" for none)
+static int bra(const char *s, char *target, char *cond)
+{
+    s = op_of(s);
+    if (strncmp(s, "BRA", 3) && strncmp(s, "CAL", 3)) return 0;
+    cond[0] = 0;
+    if (sscanf(s + 3, " %63[A-Za-z0-9_] ( %15[A-Z.xyzw] )", target, cond) < 1) return 0;
+    return 1;
+}
+// The loops inline_calls found in the last program, in order: where each
+// count comes from, program.env[arb_loop_env[k]] component arb_loop_comp[k]
+// (-1: not an environment parameter). arb_lower_counts unrolls each loop for
+// a given count instead of LOOP_UNROLL (hle_gfx.c: Ghost Squad Evolution's
+// lights, for the counts of the moment; eight passes of three kinds made
+// programs Apple's GL ran in software, a third of the speed).
+int arb_loop_env[8], arb_loop_comp[8], arb_nloops;
+static const int *want_counts;
+static int want_n;
+
+// the count's source: "nlights.x" after "PARAM nlights = program.env[160];"
+static void loop_source(char **l, int n, const char *cc_line, int k)
+{
+    arb_loop_env[k] = arb_loop_comp[k] = -1;
+    const char *comma = strchr(cc_line, ',');
+    if (!comma) return;
+    char arg[64] = "";
+    sscanf(comma + 1, " %63[^;]", arg);
+    char *dot = strrchr(arg, '.');
+    if (!dot || strlen(dot) != 2 || !strchr("xyzw", dot[1])) return;
+    int comp = dot[1] == 'x' ? 0 : dot[1] == 'y' ? 1 : dot[1] == 'z' ? 2 : 3;
+    *dot = 0;
+    int env = -1;
+    if (sscanf(arg, "program.env[%d]", &env) != 1)
+        for (int i = 0; i < n && env < 0; i++) {
+            char name[64];
+            const char *d = op_of(l[i]);
+            if (strncmp(d, "PARAM", 5) || sscanf(d + 5, " %63[A-Za-z0-9_]", name) != 1 || strcmp(name, arg)) continue;
+            const char *e = strstr(d, "program.env[");
+            const char *close = e ? strchr(e, ']') : NULL;
+            if (close && close[1] != '.') sscanf(e, "program.env[%d]", &env);
+        }
+    if (env >= 0) arb_loop_env[k] = env, arb_loop_comp[k] = comp;
+}
+
+static char *inline_calls(char *src)
+{
+    arb_nloops = 0;
+    if (!strstr(src, "CAL") || !strstr(src, "RET")) return src;
+    char **l = NULL;
+    int n = 0, cap = 0;
+    for (char *p = src; *p;) {
+        char *e = strchr(p, '\n');
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        if (n == cap) l = realloc(l, sizeof(char *) * (size_t)(cap = cap ? cap * 2 : 256));
+        l[n] = strndup(p, len);
+        char *hash = strchr(l[n], '#');   // comments out: they may hold ";" or ":"
+        if (hash) *hash = 0;
+        char *cr = strchr(l[n], '\r');    // the games' shader text has CRLF lines
+        if (cr) *cr = 0;
+        n++;
+        p += len + (e ? 1 : 0);
+    }
+    char *drop = calloc((size_t)n, 1), name[64], t[64], c[16];
+    // the subroutines: a label that a CAL names, up to RET
+    struct { char name[64]; int from, to; } sub[16];
+    int nsub = 0, ok = 1;
+    for (int i = 0; i < n && ok; i++) {
+        if (!is_label(l[i], name, sizeof name)) continue;
+        int called = 0;
+        for (int k = 0; k < n && !called; k++) called = bra(l[k], t, c) && !strncmp(op_of(l[k]), "CAL", 3) && !strcmp(t, name);
+        if (!called) continue;
+        int r = i + 1;
+        while (r < n && strncmp(op_of(l[r]), "RET", 3)) r++;
+        if (r == n || nsub == 16) { ok = 0; break; }
+        snprintf(sub[nsub].name, sizeof sub[nsub].name, "%s", name);
+        sub[nsub].from = i + 1, sub[nsub].to = r;
+        for (int k = i; k <= r; k++) drop[k] = 1;
+        nsub++;
+    }
+    struct out o = {0};
+    puts_(&o, "");
+    for (int i = 0; i < n && ok; i++) {
+        if (drop[i]) continue;
+        // BRA past the subroutines to the label that now follows it
+        if (bra(l[i], t, c) && !c[0] && !strncmp(op_of(l[i]), "BRA", 3)) {
+            int k = i + 1;
+            while (k < n && (drop[k] || !*op_of(l[k]))) k++;
+            if (k < n && is_label(l[k], name, sizeof name) && !strcmp(name, t)) continue;
+            ok = 0;
+            break;
+        }
+        // the do-while: a CC update (then instructions that keep it), BRA end
+        // (test), start:, body, CC update, BRA start (test)
+        char end_name[64], c1[16];
+        int b = i + 1;
+        if (sets_cc(l[i]))
+            while (b < n && (!*op_of(l[b]) || (!sets_cc(l[b]) && !bra(l[b], t, c) && !is_label(l[b], name, sizeof name) &&
+                                                strncmp(op_of(l[b]), "RET", 3))))
+                b++;
+        int s0 = b + 1;
+        while (s0 < n && !*op_of(l[s0])) s0++;
+        if (sets_cc(l[i]) && b < n && s0 < n && bra(l[b], end_name, c1) && c1[0] && !strncmp(op_of(l[b]), "BRA", 3) &&
+            is_label(l[s0], name, sizeof name)) {
+            for (int k = i; k < b; k++) {   // the count, and what comes before the test
+                puts_(&o, l[k]);
+                puts_(&o, "\n");
+            }
+            int j = s0 + 1, m = -1;
+            for (; j < n; j++) {
+                if (bra(l[j], t, c) && !strncmp(op_of(l[j]), "BRA", 3)) {
+                    if (!strcmp(t, name) && j > i + 3 && sets_cc(l[j - 1])) m = j - 1;
+                    break;
+                }
+                if (sets_cc(l[j]) && !(j + 1 < n && bra(l[j + 1], t, c) && !strcmp(t, name))) break;
+            }
+            // the CC update that closes the loop is the last thing before its BRA
+            char test[16];
+            if (m < 0 || !bra(l[m + 1], t, test) || !test[0]) { ok = 0; break; }
+            int passes = LOOP_UNROLL;
+            if (arb_nloops < 8) {
+                if (want_counts && arb_nloops < want_n) passes = want_counts[arb_nloops];
+                loop_source(l, n, l[i], arb_nloops++);
+            }
+            for (int r = 0; r < passes; r++) {
+                for (int k = s0 + 1; k < m; k++) {
+                    const char *b = op_of(l[k]);
+                    if (!*b) continue;
+                    const char *body[64];
+                    int nb = 0;
+                    if (!strncmp(b, "CAL", 3)) {   // the subroutine, inline
+                        bra(b, t, c);
+                        int f = -1;
+                        for (int q = 0; q < nsub; q++) if (!strcmp(sub[q].name, t)) f = q;
+                        if (f < 0 || strcmp(c, test)) { ok = 0; break; }
+                        for (int q = sub[f].from; q < sub[f].to && nb < 64; q++)
+                            if (*op_of(l[q])) body[nb++] = op_of(l[q]);
+                    } else body[nb++] = b;
+                    for (int q = 0; q < nb; q++) {
+                        const char *x = body[q], *comma = strchr(x, ',');
+                        if (!strncmp(x, "ARL", 3) || !comma) {   // addresses: unconditional
+                            puts_(&o, x);
+                            puts_(&o, "\n");
+                            continue;
+                        }
+                        if (memchr(x, '(', (size_t)(comma - x))) { ok = 0; break; }
+                        put(&o, x, (size_t)(comma - x));
+                        char cnd[24];
+                        snprintf(cnd, sizeof cnd, " (%s)", test);
+                        puts_(&o, cnd);
+                        puts_(&o, comma);
+                        puts_(&o, "\n");
+                    }
+                    if (!ok) break;
+                }
+                puts_(&o, op_of(l[m]));   // the count's update, every pass
+                puts_(&o, "\n");
+            }
+            // past the loop: the end label is dropped as a label
+            i = m + 1;
+            continue;
+        }
+        if (!strncmp(op_of(l[i]), "CAL", 3) || !strncmp(op_of(l[i]), "BRA", 3)) { ok = 0; break; }
+        if (is_label(l[i], name, sizeof name)) continue;   // nothing branches any more
+        puts_(&o, l[i]);
+        puts_(&o, "\n");
+    }
+    for (int i = 0; i < n; i++) free(l[i]);
+    free(l);
+    free(drop);
+    if (!ok) {
+        free(o.p);
+        return src;
+    }
+    free(src);
+    return o.p;
+}
+
+char *arb_lower_nv(char *src);
+char *arb_lower_counts(char *src, const int *counts, int n)
+{
+    want_counts = counts, want_n = n;
+    src = arb_lower_nv(src);
+    want_counts = NULL, want_n = 0;
+    return src;
+}
+
+// A vertex program's writes to the back colours (result.color.back.*, and
+// the OUTPUT names bound to them) taken out: used only with two-sided
+// lighting (GL_VERTEX_PROGRAM_TWO_SIDE), and one output too many crashed
+// Apple's Metal shader compiler (MTLCompilerService, in LLVM's register
+// allocation) on Ghost Squad Evolution's lights: the game froze waiting for
+// it. hle_gfx.c calls it on Apple's GL while the game hasn't turned two-sided
+// lighting on.
+char *arb_drop_back_colors(char *src)
+{
+    if (strncmp(src, "!!ARBvp", 7) || !strstr(src, "result.color.back")) return src;
+    char names[8][64];
+    int nn = 0;
+    for (const char *p = src; (p = strstr(p, "OUTPUT")) && nn < 8; p += 6) {
+        char name[64], what[96];
+        if (sscanf(p + 6, " %63[A-Za-z0-9_] = %95[A-Za-z0-9_.]", name, what) == 2 && !strncmp(what, "result.color.back", 17))
+            snprintf(names[nn++], sizeof names[0], "%s", name);
+    }
+    struct out o = {0};
+    puts_(&o, "");
+    for (const char *line = src; *line;) {
+        const char *e = strchr(line, '\n');
+        size_t len = e ? (size_t)(e - line + 1) : strlen(line);
+        const char *s = line;
+        while (*s == ' ' || *s == '\t') s++;
+        int drop = 0;
+        if (starts_word(s, "OUTPUT")) {
+            drop = strstr(s, "result.color.back") && (size_t)(strstr(s, "result.color.back") - line) < len;
+        } else if (*s != '#' && *s != '!') {
+            // an instruction: its destination is the first operand
+            const char *d = s + strspn(s, "ABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789");
+            while (*d == ' ' || *d == '\t') d++;
+            if (d > s && (size_t)(d - line) < len) {
+                if (!strncmp(d, "result.color.back", 17)) drop = 1;
+                for (int k = 0; k < nn && !drop; k++) {
+                    size_t l = strlen(names[k]);
+                    drop = !strncmp(d, names[k], l) && !isalnum((unsigned char)d[l]) && d[l] != '_';
+                }
+            }
+        }
+        if (!drop) put(&o, line, len);
+        line += len;
+    }
     free(src);
     return o.p;
 }
@@ -213,7 +645,7 @@ static char *unroll_loops(char *src)
 char *arb_lower_nv(char *src)
 {
     if (!strstr(src, "OPTION NV_")) return src;
-    src = unroll_loops(src);
+    src = lower_nrm(unroll_loops(inline_calls(src)));
     int vertex = !strncmp(src, "!!ARBvp", 7);
 
     // outputs written under a condition (Let's Go Jungle's
@@ -277,7 +709,7 @@ char *arb_lower_nv(char *src)
         size_t w = strspn(s, "ABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789");
         if (w && s[w] == ':') continue;
         if (!declared) {   // the clamp's temporary and constants, ahead of everything else
-            puts_(&o, "TEMP lbSat, lbAbs0, lbAbs1, lbAbs2, lbHC, lbCnd, lbMask;\n"
+            puts_(&o, "TEMP lbSat, lbAbs0, lbAbs1, lbAbs2, lbHC, lbCnd, lbMask, lbNrm;\n"
                       "PARAM lbZeroOne = { 0, 1, 0, 0 };\n");
 #ifndef LB_IOS
             if (vertex && (strstr(src, "SIN") || strstr(src, "COS")))
@@ -355,6 +787,30 @@ char *arb_lower_nv(char *src)
         char a[4][512];
         int na = split_args(args, a);
         if (na < 1) goto give_up;
+        // KIL on a condition (NV_fragment_program2: KIL LE.x, Harley-Davidson's
+        // alpha tests): 1 where the test holds, and ARB's KIL of its negation
+        // (it discards where a component is below 0)
+        if (!strcmp(base, "KIL") && na == 1 && strlen(a[0]) >= 2 && isupper((unsigned char)a[0][0]) &&
+            isupper((unsigned char)a[0][1]) && (!a[0][2] || a[0][2] == '.')) {
+            static const struct { const char *test, *mask; } kil_tests[] = {
+                {"GT", "SLT lbMask, lbZeroOne.x, lbHC;\n"},
+                {"LT", "SLT lbMask, lbHC, lbZeroOne.x;\n"},
+                {"GE", "SGE lbMask, lbHC, lbZeroOne.x;\n"},
+                {"LE", "SGE lbMask, lbZeroOne.x, lbHC;\n"},
+                {"NE", "ABS lbMask, lbHC;\nSLT lbMask, lbZeroOne.x, lbMask;\n"},
+                {"EQ", "ABS lbMask, lbHC;\nSGE lbMask, lbZeroOne.x, lbMask;\n"},
+                {"TR", "MOV lbMask, lbZeroOne.y;\n"},
+            };
+            const char *mask = NULL;
+            for (int k = 0; k < 7; k++)
+                if (!strncmp(a[0], kil_tests[k].test, 2)) mask = kil_tests[k].mask;
+            if (!strncmp(a[0], "FL", 2)) continue;   // never
+            if (!mask) goto give_up;
+            char l[600];
+            snprintf(l, sizeof l, "%sKIL -lbMask%s;\n", mask, a[0] + 2);
+            puts_(&o, l);
+            continue;
+        }
         for (int k = 0; k < nouts; k++) {
             size_t tl = strlen(outs[k]);
             const char *rest = a[0] + tl;   // nothing, a write mask, a condition
@@ -658,19 +1114,47 @@ char *arb_inline_constants(char *src)
     return o.p;
 }
 
-// Relative addressing with no offset (c[A0.x]): gl4es's ARB parser takes only
-// c[A0.x + n] and rejects the program ("Invalid state"; Let's Go Jungle's and
-// Sega Race TV's skinning). The offset is written out as + 0.
+// Relative addressing (c[A0.x], c[A0.x+8], c[A0.x +1]): gl4es's ARB parser
+// takes only c[A0.x + n], with the sign spaced out, and rejects the program
+// otherwise ("Invalid state"; Let's Go Jungle's and Sega Race TV's skinning,
+// Ghost Squad Evolution's lights through its own address registers). Every
+// [<register>.x ...] is written that way, + 0 where it has no offset.
 char *arb_address_offsets(char *src)
 {
-    if (!strstr(src, "[A0.x]")) return src;
+    if (!strstr(src, ".x")) return src;
     struct out o = {0};
     puts_(&o, "");
-    for (char *p = src, *q; (q = strstr(p, "[A0.x]")); p = q + 6) {
-        put(&o, p, (size_t)(q - p));
-        puts_(&o, "[A0.x + 0]");
-        if (!strstr(q + 6, "[A0.x]")) puts_(&o, q + 6);
+    int changed = 0;
+    for (char *p = src; *p;) {
+        if (*p == '[') {
+            const char *q = p + 1;
+            while (*q == ' ' || *q == '\t') q++;
+            const char *r = q;
+            while (*r == '_' || (*r >= '0' && *r <= '9') || (*r >= 'A' && *r <= 'Z') || (*r >= 'a' && *r <= 'z')) r++;
+            if (r > q && !(*q >= '0' && *q <= '9') && r[0] == '.' && r[1] == 'x') {
+                const char *t = r + 2;
+                while (*t == ' ' || *t == '\t') t++;
+                char sign = '+';
+                if (*t == '+' || *t == '-') sign = *t++;
+                while (*t == ' ' || *t == '\t') t++;
+                const char *d = t;
+                while (*t >= '0' && *t <= '9') t++;
+                const char *e = t;
+                while (*e == ' ' || *e == '\t') e++;
+                if (*e == ']' && (d < t || sign == '+') && (d < t || t == r + 2 + strspn(r + 2, " \t"))) {
+                    char line[160];
+                    snprintf(line, sizeof line, "[%.*s.x %c %.*s]", (int)(r - q), q, sign, d < t ? (int)(t - d) : 1, d < t ? d : "0");
+                    if (strncmp(p, line, strlen(line)) || p + strlen(line) != e + 1) changed = 1;
+                    puts_(&o, line);
+                    p = (char *)e + 1;
+                    continue;
+                }
+            }
+        }
+        put(&o, p, 1);
+        p++;
     }
+    if (!changed) { free(o.p); return src; }
     free(src);
     return o.p;
 }
@@ -753,4 +1237,164 @@ char *arb_shadow_lookups(char *src)
     }
     free(src);
     return o.p;
+}
+
+// state.matrix.program[n] (Ghost Squad Evolution's vertex programs declare
+// three, with their inverse transposes), which gl4es does not bind and
+// rejects the program for: a PARAM of one that the program never reads is
+// left out. One that is read stays, and the program fails as before.
+char *arb_program_matrices(char *src)
+{
+    if (strncmp(src, "!!ARBvp", 7) || !strstr(src, "state.matrix.program")) return src;
+    struct out o = {0};
+    puts_(&o, "");
+    int dropped = 0;
+    for (const char *s = src; *s;) {
+        const char *e = strchr(s, '\n');
+        size_t len = e ? (size_t)(e - s + 1) : strlen(s);
+        const char *t = s;
+        while (*t == ' ' || *t == '\t') t++;
+        char name[64];
+        int unused = 0;
+        if (starts_word(t, "PARAM") && sscanf(t + 5, " %63[A-Za-z0-9_]", name) == 1) {
+            const char *semi = strchr(t, ';');
+            const char *m = strstr(t, "state.matrix.program");
+            if (semi && m && m < semi) {
+                unused = 1;   // read anywhere but its own line?
+                size_t nl = strlen(name);
+                for (const char *q = src; (q = strstr(q, name)); q += nl) {
+                    int word = (q == src || !(q[-1] == '_' || (q[-1] >= '0' && q[-1] <= '9') || (q[-1] >= 'A' && q[-1] <= 'Z') || (q[-1] >= 'a' && q[-1] <= 'z')))
+                               && !(q[nl] == '_' || (q[nl] >= '0' && q[nl] <= '9') || (q[nl] >= 'A' && q[nl] <= 'Z') || (q[nl] >= 'a' && q[nl] <= 'z'));
+                    if (word && (q < s || q >= s + len)) { unused = 0; break; }
+                }
+            }
+        }
+        if (unused) dropped = 1;
+        else put(&o, s, len);
+        s += len;
+    }
+    if (!dropped) { free(o.p); return src; }
+    free(src);
+    return o.p;
+}
+
+// Rectangle textures in fragment programs (TEX, TXP, TXB ..., RECT: Ghost
+// Squad Evolution's 2D and post effects), which gl4es rejects ("Invalid
+// texture sampler target"): gl4es keeps a rectangle texture as a 2D one,
+// sampled with coordinates 0..1, so the lookup becomes a 2D one with its
+// s and t scaled by program environment parameter 24 + unit, which the
+// runtime keeps at 1 / the size of the rectangle texture bound on units 0-7
+// (hle_gfx.c, rect_env_update). Scaling before TXP's divide is the same
+// as after it.
+#define RECT_ENV 24
+char *arb_rect_lookups(char *src)
+{
+    if (strncmp(src, "!!ARBfp", 7) || !strstr(src, "RECT")) return src;
+    struct out o = {0};
+    puts_(&o, "");
+    int any = 0;
+    const char *decl_at;   // where TEMPs may go: after the header and its OPTIONs
+    const char *p = strchr(src, '\n');
+    decl_at = p ? p + 1 : src + strlen(src);
+    for (const char *q = decl_at; (q = strstr(q, "OPTION")); q += 6) {
+        const char *e = strchr(q, ';');
+        if (e) decl_at = e + 1;
+    }
+    put(&o, src, (size_t)(decl_at - src));
+    puts_(&o, "\nTEMP _rcS;\n");
+    for (const char *s = decl_at; *s;) {
+        const char *e = strchr(s, ';');
+        if (!e) { puts_(&o, s); break; }
+        const char *t = s;
+        while (*t == ' ' || *t == '\t' || *t == '\n' || *t == '\r') t++;
+        const char *op = NULL;
+        static const char *const ops[] = {"TEX", "TXP", "TXB", "TEX_SAT", "TXP_SAT", "TXB_SAT"};
+        for (int k = 0; k < 6; k++)
+            if (starts_word(t, ops[k])) op = ops[k];
+        char a[4][512];
+        int unit = -1;
+        if (op && split_args(t + strlen(op), a) == 4 && !strcmp(a[3], "RECT")) {
+            char tex[512], *d = tex;
+            for (const char *q = a[2]; *q; q++)
+                if (*q != ' ' && *q != '\t') *d++ = *q;
+            *d = 0;
+            if (sscanf(tex, "texture[%d]", &unit) != 1 || unit < 0 || unit > 7) unit = -1;
+        }
+        if (unit >= 0) {
+            char line[2048];
+            put(&o, s, (size_t)(t - s));
+            snprintf(line, sizeof line, "MOV _rcS, %s;\nMUL _rcS.xy, _rcS, program.env[%d];\n%s %s, _rcS, %s, 2D",
+                     a[1], RECT_ENV + unit, op, a[0], a[2]);
+            puts_(&o, line);
+            any = 1;
+        } else
+            put(&o, s, (size_t)(e - s));
+        puts_(&o, ";");
+        s = e + 1;
+    }
+    if (!any) {
+        free(o.p);
+        return src;
+    }
+    free(src);
+    return o.p;
+}
+
+// OUTPUT aliases (OUTPUT oTxc0 = result.texcoord[0]: every one of Ghost
+// Squad Evolution's programs), which gl4es handles badly: an indexed result
+// is refused ("Invalid token" at the '['), result.pointsize copied to an
+// expression (vec4(gl_Point.size, ...) = oPtsize) and result.depth through a
+// misspelt name (gl4es_FragDe), so the shader does not compile. The
+// declaration is dropped and the alias written as its binding wherever the
+// program uses it.
+static int ident_char(char ch) { return ch == '_' || (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z'); }
+char *arb_output_aliases(char *src)
+{
+    if (!strstr(src, "OUTPUT")) return src;
+    char names[32][64], binds[32][96];
+    int n = 0;
+    struct out o = {0};
+    puts_(&o, "");
+    for (const char *s = src; *s;) {   // the declarations, kept out
+        const char *e = strchr(s, '\n');
+        size_t len = e ? (size_t)(e - s + 1) : strlen(s);
+        const char *t = s;
+        while (*t == ' ' || *t == '\t') t++;
+        char name[64], bind[96];
+        if (n < 32 && starts_word(t, "OUTPUT") && sscanf(t + 6, " %63[A-Za-z0-9_] = %95[^; \t]", name, bind) == 2) {
+            strcpy(names[n], name), strcpy(binds[n++], bind);
+            const char *semi = strchr(t, ';');
+            if (semi && semi < s + len) put(&o, semi + 1, (size_t)(s + len - semi - 1));   // a comment after it
+        } else
+            put(&o, s, len);
+        s += len;
+    }
+    if (!n) { free(o.p); return src; }
+    free(src);
+    struct out r = {0};
+    puts_(&r, "");
+    for (const char *p = o.p; *p;) {   // each use of an alias
+        if (*p == '#') {   // a comment runs to the line's end
+            const char *e = strchr(p, '\n');
+            size_t len = e ? (size_t)(e - p) : strlen(p);
+            put(&r, p, len);
+            p += len;
+            continue;
+        }
+        if (ident_char(*p) && (p == o.p || !ident_char(p[-1]))) {
+            size_t w = 0;
+            while (ident_char(p[w])) w++;
+            int k = -1;
+            for (int i = 0; i < n && k < 0; i++)
+                if (strlen(names[i]) == w && !strncmp(p, names[i], w)) k = i;
+            if (k >= 0) puts_(&r, binds[k]);
+            else put(&r, p, w);
+            p += w;
+            continue;
+        }
+        put(&r, p, 1);
+        p++;
+    }
+    free(o.p);
+    return r.p;
 }

@@ -84,10 +84,17 @@ static void create_context(void)
 #endif
 }
 
+// the game's framebuffer: the window, or larger (GAME_FB_SIZE, as
+// host_core_ios.m); what is shown is the window, from the bottom left
+#ifndef LB_FB_W
+#define LB_FB_W 0
+#define LB_FB_H 0
+#endif
 void host_gl_open(int w, int h)
 {
     if (fbo) return;
     win_w = w, win_h = h;
+    int fw = w > LB_FB_W ? w : LB_FB_W, fh = h > LB_FB_H ? h : LB_FB_H;
     create_context();
     make_current(1);
     gen_fb = host_gl_proc("glGenFramebuffersEXT");
@@ -105,11 +112,11 @@ void host_gl_open(int w, int h)
     bind_fb(GL_FRAMEBUFFER_EXT, fbo);
     gen_rb(1, &color_rb);
     bind_rb(GL_RENDERBUFFER_EXT, color_rb);
-    rb_storage(GL_RENDERBUFFER_EXT, GL_RGBA8, w, h);
+    rb_storage(GL_RENDERBUFFER_EXT, GL_RGBA8, fw, fh);
     fb_rb(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_RENDERBUFFER_EXT, color_rb);
     gen_rb(1, &depth_rb);
     bind_rb(GL_RENDERBUFFER_EXT, depth_rb);
-    rb_storage(GL_RENDERBUFFER_EXT, GL_DEPTH24_STENCIL8_EXT, w, h);
+    rb_storage(GL_RENDERBUFFER_EXT, GL_DEPTH24_STENCIL8_EXT, fw, fh);
     fb_rb(GL_FRAMEBUFFER_EXT, GL_DEPTH_ATTACHMENT_EXT, GL_RENDERBUFFER_EXT, depth_rb);
     fb_rb(GL_FRAMEBUFFER_EXT, GL_STENCIL_ATTACHMENT_EXT, GL_RENDERBUFFER_EXT, depth_rb);
     if (fb_status(GL_FRAMEBUFFER_EXT) != GL_FRAMEBUFFER_COMPLETE_EXT) host_fatal("the game's framebuffer is incomplete");

@@ -405,12 +405,15 @@ static const device_ops i2c_dev = {"/dev/i2c/0", i2c_open, i2c_ioctl, NULL, NULL
 // position (reply 0x14, a centred one here). OutRun 2 SP's board answers each packet with
 // a status byte, the status in both nibbles: 1 after command 0x01 (the motor check its
 // start-up runs), 0 (ready) otherwise; it homes the wheel on the JVS steering input.
+// Hummer's (clSteerDualDevice; the same packets, its 0x01 sets the limiter, 0x7c
+// is its self check) is always ready (0): any other status is an error or busy.
 static uint8_t drive_out[256];
 static int drive_n, drive_pos;
 static uint8_t drive_cmd[4];
 static int drive_cmd_n;
 
-static int drive_open(void) { drive_n = drive_pos = drive_cmd_n = 0; return 0; }
+static int drive_long;   // bike: answers are 4 bytes (after the first read)
+static int drive_open(void) { drive_n = drive_pos = drive_cmd_n = drive_long = 0; return 0; }
 
 static int drive_ioctl(uint32_t req, uint32_t a)
 {
@@ -422,13 +425,46 @@ static int drive_ioctl(uint32_t req, uint32_t a)
 static int drive_write(uint32_t buf, uint32_t n)
 {
     const uint8_t *p = (const uint8_t *)G(buf);
+#ifdef LB_DRIVE_BIKE
+    // Harley-Davidson's handlebar board: the same 4-byte packets. Each is
+    // answered with a status byte (0: ready) until the first read (command
+    // 0x7a, its second data byte 0x10-0x17: what to read); from then on the
+    // game takes every answer as 4 bytes: 0x80 | a code, two 7-bit data bytes
+    // and an XOR check. A read's code is what it read (0x14: the handlebar's
+    // 14-bit position, centred here: the handlebar itself is on JVS); other
+    // commands get their own code and data back
+    if (n >= 4 && (p[0] & 0x80)) {
+        if (hle_verbose) hle_log("drive: %02x %02x %02x\n", p[0], p[1], p[2]);
+        if (drive_pos == drive_n) drive_n = drive_pos = 0;
+        int read = (p[0] & 0x7f) == 0x7a && p[2] >= 0x10 && p[2] <= 0x17;
+        if (read) drive_long = 1;
+        if (drive_long && drive_n + 4 <= (int)sizeof drive_out) {
+            uint8_t r0, hi, lo;
+            if (read) {
+                int pos = p[2] == 0x14 ? 0x2000 : 0;
+                r0 = (uint8_t)(0x80 | p[2]), hi = (uint8_t)(pos >> 7 & 0x7f), lo = (uint8_t)(pos & 0x7f);
+            } else
+                r0 = (uint8_t)(0x80 | (p[0] & 0x1f)), hi = p[1] & 0x7f, lo = p[2] & 0x7f;
+            drive_out[drive_n++] = r0;
+            drive_out[drive_n++] = hi;
+            drive_out[drive_n++] = lo;
+            drive_out[drive_n++] = (uint8_t)((r0 & 0x7f) ^ hi ^ lo);
+        } else if (!drive_long && drive_n < (int)sizeof drive_out)
+            drive_out[drive_n++] = 0;
+    }
+    return (int)n;
+#endif
 #ifdef LB_DRIVE_STATUS
     // a packet per write: 4 bytes for one wheel, 7 for a twin cabinet's two (two data
     // bytes each); a status byte per wheel
     if (n >= 4 && (p[0] & 0x80)) {
         if (hle_verbose) hle_log("drive: %02x (%u bytes)\n", p[0], n);
         if (drive_pos == drive_n) drive_n = drive_pos = 0;
+#ifdef LB_DRIVE_READY
+        uint8_t st = 0;
+#else
         uint8_t st = (p[0] & 0x7f) == 0x01 ? 1 : 0;
+#endif
         for (uint32_t w = 0; w < (n - 1) / 3 && drive_n < (int)sizeof drive_out; w++)
             drive_out[drive_n++] = (uint8_t)(st << 4 | st);
     }
@@ -533,8 +569,12 @@ int virtual_file(const char *path, const void **data, size_t *size)
     if (!strncmp(path, "/usr/lib/boot/", 14)) {
         if (!font_tga[2]) build_boot_files();
         const char *n = path + 14;
-        if (!strcmp(n, "LucidaConsole_12.tga")) *data = font_tga, *size = sizeof font_tga;
-        else if (!strcmp(n, "LucidaConsole_12.abc")) *data = font_abc, *size = sizeof font_abc;
+        // the cabinet's system font; 2 Spicy's game and test menu load the
+        // Roman half of SEGA_KakuGothic in the same format: the same stand-in
+        if (!strcmp(n, "LucidaConsole_12.tga") || !strcmp(n, "SEGA_KakuGothic-DB-Roman_12.tga"))
+            *data = font_tga, *size = sizeof font_tga;
+        else if (!strcmp(n, "LucidaConsole_12.abc") || !strcmp(n, "SEGA_KakuGothic-DB-Roman_12.abc"))
+            *data = font_abc, *size = sizeof font_abc;
         else if (!strcmp(n, "logo.tga")) *data = logo_tga, *size = sizeof logo_tga;
         else return 0;
         return 1;
@@ -562,12 +602,115 @@ int virtual_file(const char *path, const void **data, size_t *size)
     return 0;
 }
 
+// ---- Let's Go Jungle Special's motion seat on /dev/ttyS0 ------------------------------
+// LGJCbord (its seat board) sends 7-byte packets, 0xc0, a command and four
+// bytes, then the XOR of those five; the board answers 22 bytes, 0xc0, twenty
+// status bytes and their XOR. Status byte 2 is the board's state, which the
+// game's seat loop (usrCbordLoop) waits on: 1 ready; 3 after command 2 (the
+// prompt to press the seat's INITIALIZE button, which is wired to the board:
+// pressed at once here); 5 after command 4 (initialize: the seat at its
+// start position); for the others the state follows the command. Bytes 4-6
+// are its sensors' alarms (armrests, belts, obstacles) and byte 7 its error
+// number: all clear. With no board the game waits for ever on its INITIALIZE
+// prompt.
+static uint8_t seat_out[512], seat_cmd[8], seat_state = 1;
+static int seat_n, seat_pos, seat_cmd_n;
+
+static int seat_open(void) { seat_n = seat_pos = seat_cmd_n = 0; seat_state = 1; return 0; }
+static int seat_ioctl(uint32_t req, uint32_t a)
+{
+    if (req == 0x541b) { wr32(a, (uint32_t)(seat_n - seat_pos)); return 0; }   // FIONREAD
+    return 0;                                                                 // termios settings
+}
+static int seat_write(uint32_t buf, uint32_t n)
+{
+    const uint8_t *p = (const uint8_t *)G(buf);
+    for (uint32_t i = 0; i < n; i++) {
+        if (p[i] == 0xc0 && seat_cmd_n != 6) seat_cmd_n = 0;   // a packet starts (unless it's the check byte)
+        if (seat_cmd_n < 7) seat_cmd[seat_cmd_n++] = p[i];
+        if (seat_cmd_n < 7) continue;
+        seat_cmd_n = 0;
+        uint8_t x = 0;
+        for (int k = 1; k < 6; k++) x ^= seat_cmd[k];
+        if (seat_cmd[0] != 0xc0 || x != seat_cmd[6]) continue;
+        uint8_t cmd = seat_cmd[1];
+        uint8_t st = cmd == 0 ? seat_state : cmd == 2 ? 3 : cmd == 4 ? 5 : cmd;
+        if (st != seat_state && hle_verbose) hle_log("seat: command %02x, state %02x\n", cmd, st);
+        seat_state = st;
+        if (seat_pos == seat_n) seat_n = seat_pos = 0;
+        if (seat_n + 22 > (int)sizeof seat_out) continue;
+        uint8_t *r = seat_out + seat_n;
+        memset(r, 0, 22);
+        r[0] = 0xc0;
+        r[2] = seat_state;
+        for (int k = 1; k <= 20; k++) r[21] ^= r[k];
+        seat_n += 22;
+    }
+    return (int)n;
+}
+static int seat_read(uint32_t buf, uint32_t n)
+{
+    int m = seat_n - seat_pos;
+    if (m > (int)n) m = (int)n;
+    memcpy(G(buf), seat_out + seat_pos, m);
+    seat_pos += m;
+    return m;
+}
+static int seat_select(void) { return seat_n > seat_pos; }
+static const device_ops seat_dev = {"/dev/ttyS0", seat_open, seat_ioctl, seat_read, seat_write, seat_select};
+
+// ---- a touch panel on the serial port: /dev/tts/0 (Primeval Hunt) ---------------------
+// It reports 10-byte frames: 0x55 0x54, a status byte, x and y (16 bits, low
+// byte first), two more bytes and a check (0xaa plus the sum of the first
+// nine). The game's reader thread reads it a byte at a time, blocking; here a
+// frame comes every 10 ms, with the front end's touch (touch_in: status 1 and
+// where; the game takes x and y as 0 .. 4095 across the panel's 640x480).
+touch_input touch_in;
+#ifdef LB_TOUCH_PANEL
+static uint8_t touch_frame[10];
+static int touch_pos = 10;
+static int touch_open(void) { touch_pos = 10; return 0; }
+static int touch_ioctl(uint32_t req, uint32_t a)
+{
+    if (req == 0x541b) wr32(a, (uint32_t)(10 - touch_pos));   // FIONREAD
+    return 0;                                                 // termios settings
+}
+static int touch_read(uint32_t buf, uint32_t n)
+{
+    if (touch_pos >= 10) {
+        guest_sleep_us(10000);
+        memset(touch_frame, 0, sizeof touch_frame);
+        touch_frame[0] = 0x55;
+        touch_frame[1] = 0x54;
+        if (touch_in.down) {
+            touch_frame[2] = 1;
+            touch_frame[3] = (uint8_t)touch_in.x, touch_frame[4] = (uint8_t)(touch_in.x >> 8);
+            touch_frame[5] = (uint8_t)touch_in.y, touch_frame[6] = (uint8_t)(touch_in.y >> 8);
+        }
+        uint8_t sum = 0xaa;
+        for (int i = 0; i < 9; i++) sum += touch_frame[i];
+        touch_frame[9] = sum;
+        touch_pos = 0;
+    }
+    uint32_t k = 0;
+    while (k < n && touch_pos < 10) wr8(buf + k++, touch_frame[touch_pos++]);
+    return (int)k;
+}
+static int touch_write(uint32_t buf, uint32_t n) { (void)buf; return (int)n; }
+static int touch_select(void) { return 1; }
+static const device_ops touch_dev = {"/dev/tts/0", touch_open, touch_ioctl, touch_read, touch_write, touch_select};
+#endif
+
 const device_ops *device_for_path(const char *p)
 {
+#ifdef LB_TOUCH_PANEL
+    if (!strcmp(p, touch_dev.path)) return &touch_dev;
+#endif
     if (!strcmp(p, lbb_dev.path)) return &lbb_dev;
     if (!strcmp(p, i2c_dev.path)) return &i2c_dev;
     if (!strcmp(p, drive_dev.path)) return &drive_dev;
     if (!strcmp(p, tts1_dev.path)) return &tts1_dev;
+    if (!strcmp(p, seat_dev.path)) return &seat_dev;
     return NULL;
 }
 
@@ -618,6 +761,16 @@ void ovr_XF86VidModeSwitchToMode(CPU *c) { RET(0); }
 
 // Sega Race TV's own gettid makes the system call (int 0x80)
 void ovr_gettid(CPU *c) { RET(1000); }
+// Let's Go Jungle Special's coin chute and service types (acpSystem::
+// getChuteType, getServiceType, from the credit settings): its cabinet has a
+// chute and a service button per player (0, individual), and with any other
+// type it stops at boot with Error 211 (LGJCbord::init). A new EEPROM's credit
+// settings give another, which an operator would change in the test menu.
+void ovr__ZN9acpSystem12getChuteTypeEv(CPU *c) { RET(0); }
+void ovr__ZN9acpSystem14getServiceTypeEv(CPU *c) { RET(0); }
+// Ghost Squad Evolution's report of its heap at boot, for its debug trace:
+// a call per byte of its 27 MB heap (isprint), minutes here
+void ovr__Z14show_heap_infov(CPU *c) { (void)c; }
 // The region the front end chose (afcore set_option "region", the core's
 // options): 0 Export, 1 USA, 2 Japan. The games keep theirs in the system
 // data of their EEPROM, which the runtime writes (eeprom_set_region); Race
@@ -669,16 +822,42 @@ void ovr_amDongleUserInfoEx(CPU *c)
     RET(0);
 }
 
+// The keychip's encryption (amDongleSetIv, amDongleDecryptEx: requests that
+// amDongleUpdate, replaced, would send): taken at once (0), the output left as
+// it is; Hummer's check of what it decrypts is patched (games/hummerxt)
+void ovr_amDongleSetIv(CPU *c) { RET(0); }
+void ovr_amDongleDecryptEx(CPU *c) { RET(0); }
+
+// amOsinfoModifyNetworkProperty (amLib): sets the cabinet's network address,
+// mask and gateway (the system's files and tools); there is no network to set
+// up here, and Hummer's clNetwork takes a failure as Error 1301 ("Unable to
+// conduct internal cabinet communication connection"): done (0)
+void ovr_amOsinfoModifyNetworkProperty(CPU *c) { RET(0); }
+
+// amLib's security device (ams): a chip on the keychip, read over its I2C
+// (amDongleSendI2C, amDongleRecvI2C), that the library checks with a MAC
+// and an RSA signature at start (amsInit) and every hour (amsUpdate, from
+// Hummer's main loop). There is none here: both report it as checked (0)
+void ovr_amsInit(CPU *c) { RET(0); }
+void ovr_amsUpdate(CPU *c) { RET(0); }
+
 // Let's Go Jungle's full-screen setup asks the XF86VidMode extension for the
-// current mode before it creates its window: one 1360x768 mode, as the screen
+// current mode before it creates its window. The X server's one video mode is
+// the game's screen (GAME_WIDTH x GAME_HEIGHT, or GAME_MODE_SIZE), with the
+// blanking of 1360x768 (Let's Go Jungle's): a game asks for its own size and
+// gives up if the server has no such mode (Let's Go Jungle Special's 2048x768,
+// its cabinet's two outputs side by side: TwinView).
+// its dot clock (kHz) for 60 Hz, rounded up: Hummer checks for a 60 Hz mode
+#define MODE_DOTCLOCK ((uint32_t)(((LB_MODE_W + 432) * (LB_MODE_H + 27) * 60 + 999) / 1000))
 static void put_mode(uint32_t at)   // 9 shorts: h display/sync start/sync end/total/skew, v display/...
 {
-    static const uint16_t m[9] = {1360, 1424, 1536, 1792, 0, 768, 771, 777, 795};
+    static const uint16_t m[9] = {LB_MODE_W, LB_MODE_W + 64, LB_MODE_W + 176, LB_MODE_W + 432, 0,
+                                  LB_MODE_H, LB_MODE_H + 3, LB_MODE_H + 9, LB_MODE_H + 27};
     for (int i = 0; i < 9; i++) wr16(at + 2 * i, m[i]);
 }
 void ovr_XF86VidModeGetModeLine(CPU *c)
 {
-    if (ARG(2)) wr32(ARG(2), 85500);   // dot clock, kHz
+    if (ARG(2)) wr32(ARG(2), MODE_DOTCLOCK);   // dot clock, kHz
     memset(M + ARG(3), 0, 32);
     put_mode(ARG(3));
     RET(1);
@@ -686,7 +865,7 @@ void ovr_XF86VidModeGetModeLine(CPU *c)
 void ovr_XF86VidModeGetAllModeLines(CPU *c)
 {
     uint32_t info = guest_calloc(1, 36), list = guest_calloc(1, 4);
-    wr32(info, 85500);
+    wr32(info, MODE_DOTCLOCK);
     put_mode(info + 4);
     wr32(list, info);
     wr32(ARG(2), 1);
@@ -731,6 +910,10 @@ static void h_zero(CPU *c) { RET(0); }
 
 static const hle_entry lindbergh_table[] = {
     {"kswap_collect", h_zero},
+    // imported (2 Spicy, Hummer) rather than linked in (Let's Go Jungle)
+    {"XF86VidModeGetAllModeLines", ovr_XF86VidModeGetAllModeLines}, {"XF86VidModeSetViewPort", ovr_XF86VidModeSetViewPort},
+    {"XF86VidModeSwitchToMode", ovr_XF86VidModeSwitchToMode}, {"XF86VidModeGetModeLine", ovr_XF86VidModeGetModeLine},
+    {"XF86VidModeGetViewPort", ovr_XF86VidModeGetViewPort},
     {NULL, NULL},
 };
 
@@ -748,6 +931,11 @@ void hle_lindbergh_init(void)
     if (dip) dip_bits = (uint8_t)strtoul(dip, NULL, 0);
 #ifdef LB_DRIVING
     jvs_in.analog[0] = 0x8000;   // the wheel at its centre (OutRun 2 SP homes the drive board on it)
+#endif
+#ifdef LB_WHEEL2
+    // a twin cabinet's second wheel, which no player drives here, at its centre
+    // (Hummer's steering start-up waits for both)
+    jvs_in.analog[LB_WHEEL2] = 0x8000;
 #endif
 }
 
@@ -769,6 +957,9 @@ void hle_lindbergh_reset(void)
     memset(&jvs_in, 0, sizeof jvs_in);
 #ifdef LB_DRIVING
     jvs_in.analog[0] = 0x8000;   // the wheel at its centre (OutRun 2 SP homes the drive board on it)
+#endif
+#ifdef LB_WHEEL2
+    jvs_in.analog[LB_WHEEL2] = 0x8000;
 #endif
 }
 

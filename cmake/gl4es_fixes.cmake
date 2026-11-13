@@ -138,6 +138,41 @@
 #    whatever its buffer held (noise, the wrong colours, cars nearly black).
 #    Such a texture's level is now read from the driver block for block (the
 #    driver's glGetCompressedTexImage: mtlgles has it), exactly as uploaded.
+#  - fpe_shader.c: gl4es's own vertex shader drawn with an ARB fragment
+#    program declares each texture coordinate the program reads as a vec4
+#    but wrote it with the bound texture's own size (a rectangle texture's
+#    st, a vec2) and, for a rectangle texture, scaled to 0..1: the shader
+#    did not compile on Metal (Ghost Squad Evolution's 2D). It is written
+#    whole and unscaled, as the program's lookups expect (the runtime scales
+#    a RECT lookup itself, arb_lower.c).
+#  - arbparser.c, arbparser.h, arbconverter.c: an ARB vertex program writing
+#    result.pointsize wrote to vec4(gl_Point.size, ...), which is not
+#    assignable (the shader did not compile: Ghost Squad Evolution's
+#    particles). It goes through a temporary written to gl_PointSize at the
+#    end, as result.fogcoord does.
+#  - fpe.c: gl_LightSource[n].halfVector (a vec4) was set as one float, which
+#    gl4es's own check refused (GL_INVALID_OPERATION) at each draw with a
+#    shader that reads it: Hummer Extreme reads glGetError when it makes its
+#    render targets and stops on any. It is set as the vec4 it is.
+#  - texture_params.c: GL_TEXTURE_MAX_ANISOTROPY set with no anisotropic
+#    filtering on the driver (mtlgles) was an error (GL_INVALID_ENUM), which
+#    stopped Hummer Extreme the same way; it is let go, as no filtering.
+#  - raster.c, pixel.c: the colour maps of glPixelMap (GL_PIXEL_MAP_I_TO_R,
+#    _G, _B, _A) are bytes, but glPixelMapfv, uiv and usv stored floats in
+#    them, and a GL_COLOR_INDEX texture's colours, read from the maps as
+#    bytes, were converted as floats: Hummer's debug font (the text of its
+#    test menu), an index texture coloured through the maps, was blank.
+#  - texture_params.c: GL_TEXTURE_MAX_LEVEL was kept by gl4es and not passed
+#    on, as OpenGL ES 2 has none; OpenGL ES 3 (mtlgles) has it. Primeval Hunt
+#    gives its S3TC textures fewer mipmap levels than their full chain and sets
+#    the last; without it, distant trees sampled levels it never filled
+#    (white and noise blocks).
+#  - gl4es.c: a texture coordinate between glBegin and glEnd was kept only
+#    for a unit with texturing enabled (glEnable(GL_TEXTURE_2D)), as the fixed
+#    function needs; an ARB program samples without it. Harley-Davidson's
+#    text (glBegin quads under ARB programs) had one coordinate a quad: black.
+#    Now always kept on OpenGL ES 2 and later (a shader decides what it reads;
+#    the game need not enable the ARB program targets either).
 # Each fix is applied once, to the pristine gl4es, and an entry whose "from" is not
 # there stops the configure (most likely an earlier entry changed that text: replay
 # them with tools/replayfix.py). The patched source is then stamped with this file's
@@ -388,5 +423,48 @@ gl4es_fix("${gl4es_SOURCE_DIR}/src/gl/framebuffers.c"
 gl4es_fix("${gl4es_SOURCE_DIR}/src/gl/texture_compressed.c"
   "    errorShim(GL_INVALID_OPERATION);\n    if(bound->orig_internal!=GL_COMPRESSED_RGB && bound->orig_internal!=GL_COMPRESSED_RGBA)\n        return;"
   "    errorShim(GL_INVALID_OPERATION);\n    if(bound->native_dxt) {   // kept compressed on the driver: its blocks, as they are\n        static void (APIENTRY_GL4ES *get)(GLenum, GLint, GLvoid*) = NULL;\n        static int tried = 0;\n        if(!tried) { tried = 1; get = proc_address(gles, \"glGetCompressedTexImage\"); }\n        if(!get) return;\n        realize_bound(glstate->texture.active, target);\n        GLvoid *datab = img;\n        if(glstate->vao->pack)\n            datab = (char*)datab + (uintptr_t)glstate->vao->pack->data;\n        get(map_tex_target(target), lod, datab);\n        noerrorShim();\n        return;\n    }\n    if(bound->orig_internal!=GL_COMPRESSED_RGB && bound->orig_internal!=GL_COMPRESSED_RGBA)\n        return;")
+gl4es_fix("${gl4es_SOURCE_DIR}/src/gl/fpe_shader.c"
+  "        int t = state->texture[i].textype;\n        if(need && (need->need_texs&(1<<i)) && t==0)\n            t = 1;\n        if(need && !(need->need_texs&(1<<i)))\n            t = 0;\n        int mat = state->texture[i].texmat;\n        int adjust = state->texture[i].texadjust;"
+  "        int t = state->texture[i].textype;\n        if(need)   // as declared: all four, unscaled, for the program's own lookups\n            t = (need->need_texs&(1<<i))?1:0;\n        int mat = state->texture[i].texmat;\n        int adjust = need?0:state->texture[i].texadjust;")
+gl4es_fix("${gl4es_SOURCE_DIR}/src/gl/arbparser.h"
+  "\tint hasFogFragCoord;\n\tint isDepthReplacing;\n};"
+  "\tint hasFogFragCoord;\n\tint isDepthReplacing;\n\tint hasPointSize;\n};")
+gl4es_fix("${gl4es_SOURCE_DIR}/src/gl/arbparser.c"
+  "\t\t} else if (!strcmp(tok, \"pointsize\")) {\n\t\t\t// result.pointsize => gl_Point.size\n\t\t\tfree(tok);\n\t\t\tpushArray((sArray*)&newVar->var->init, strdup(\"vec4(gl_Point.size, 0., 0., 0.)\"));\n\t\t\tnewVar->var->init.strings_total_len = 31;"
+  "\t\t} else if (!strcmp(tok, \"pointsize\")) {\n\t\t\t// result.pointsize => gl_PointSize, through a temporary written at the end\n\t\t\tfree(tok);\n\t\t\tspecialCases->hasPointSize = 1;\n\t\t\tpushArray((sArray*)&newVar->var->init, strdup(\"gl4es_PointSizeTemp\"));\n\t\t\tnewVar->var->init.strings_total_len = 19;")
+gl4es_fix("${gl4es_SOURCE_DIR}/src/gl/arbconverter.c"
+  "\t\t\t\tAPPEND_OUTPUT(\"\\tvec4 gl4es_FogFragCoordTemp = vec4(gl_FogFragCoord);\\n\", 54)\n\t\t\t}\n"
+  "\t\t\t\tAPPEND_OUTPUT(\"\\tvec4 gl4es_FogFragCoordTemp = vec4(gl_FogFragCoord);\\n\", 54)\n\t\t\t}\n\t\t\tif (specialCases.hasPointSize) {\n\t\t\t\tAPPEND_OUTPUT(\"\\tvec4 gl4es_PointSizeTemp = vec4(1.0);\\n\", 39)\n\t\t\t}\n")
+gl4es_fix("${gl4es_SOURCE_DIR}/src/gl/arbconverter.c"
+  "\t\tif (specialCases.hasFogFragCoord) {\n\t\t\tAPPEND_OUTPUT(\"\\tgl_FogFragCoord = gl4es_FogFragCoordTemp.x;\\n\", 45)\n\t\t}\n"
+  "\t\tif (specialCases.hasFogFragCoord) {\n\t\t\tAPPEND_OUTPUT(\"\\tgl_FogFragCoord = gl4es_FogFragCoordTemp.x;\\n\", 45)\n\t\t}\n\t\tif (specialCases.hasPointSize) {\n\t\t\tAPPEND_OUTPUT(\"\\tgl_PointSize = gl4es_PointSizeTemp.x;\\n\", 39)\n\t\t}\n")
+gl4es_fix("${gl4es_SOURCE_DIR}/src/gl/fpe.c"
+  "                GoUniformfv(glprogram, glprogram->builtin_lights[i].halfVector, 1, 1, tmp);"
+  "                GoUniformfv(glprogram, glprogram->builtin_lights[i].halfVector, 4, 1, tmp);")
+gl4es_fix("${gl4es_SOURCE_DIR}/src/gl/texture_params.c"
+  "            case GL_TEXTURE_MAX_ANISOTROPY:\n                if(!hardext.aniso) {\n                    errorShim(GL_INVALID_ENUM);\n                    return;\n                }\n                if(param<0){"
+  "            case GL_TEXTURE_MAX_ANISOTROPY:\n                if(!hardext.aniso) {   // no anisotropic filtering on the driver: the setting is let go\n                    noerrorShim();\n                    return;\n                }\n                if(param<0){")
+gl4es_fix("${gl4es_SOURCE_DIR}/src/gl/raster.c"
+  "\t\tGLfloat *p = (GLfloat*)array;\n\t\tfor (int i=0; i<mapsize; i++)\n\t\t\tp[i] = values[i]*255.0f;"
+  "\t\tGLubyte *p = (GLubyte*)array;   // the maps to colours hold bytes\n\t\tfor (int i=0; i<mapsize; i++)\n\t\t\tp[i] = values[i]<=0.f?0:values[i]>=1.f?255:(GLubyte)(values[i]*255.0f+0.5f);")
+gl4es_fix("${gl4es_SOURCE_DIR}/src/gl/raster.c"
+  "\t\tGLfloat *p = (GLfloat*)array;\n\t\tfor (int i=0; i<mapsize; i++)\n\t\t\tp[i] = values[i]>>24;"
+  "\t\tGLubyte *p = (GLubyte*)array;   // the maps to colours hold bytes\n\t\tfor (int i=0; i<mapsize; i++)\n\t\t\tp[i] = values[i]>>24;")
+gl4es_fix("${gl4es_SOURCE_DIR}/src/gl/raster.c"
+  "\t\tGLfloat *p = (GLfloat*)array;\n\t\tfor (int i=0; i<mapsize; i++)\n\t\t\tp[i] = values[i]>>8;"
+  "\t\tGLubyte *p = (GLubyte*)array;   // the maps to colours hold bytes\n\t\tfor (int i=0; i<mapsize; i++)\n\t\t\tp[i] = values[i]>>8;")
+gl4es_fix("${gl4es_SOURCE_DIR}/src/gl/pixel.c"
+  "                remap_pixel((const GLvoid *)tmp, (GLvoid *)dst_pos,\n                                src_color, GL_FLOAT, dst_color, dst_type);"
+  "                remap_pixel((const GLvoid *)tmp, (GLvoid *)dst_pos,\n                                src_color, GL_UNSIGNED_BYTE, dst_color, dst_type);   // tmp holds bytes")
+gl4es_fix("${gl4es_SOURCE_DIR}/src/gl/texture_params.c"
+  "            case GL_TEXTURE_MAX_LEVEL:\n                if (texture)\n                    texture->max_level = param;\n                return;            // not on GLES"
+  "            case GL_TEXTURE_MAX_LEVEL:\n                if (texture)\n                    texture->max_level = param;\n                {   // OpenGL ES 3 has it (a texture's levels past it were sampled otherwise)\n                    static int es3 = -1;\n                    if (es3 < 0) {\n                        LOAD_GLES(glGetString);\n                        const char *v = (const char *)gles_glGetString(GL_VERSION);\n                        es3 = v && strstr(v, \"OpenGL ES 3\") != NULL;\n                    }\n                    if (!es3) return;   // not on GLES 2\n                }\n                break;")
+
+gl4es_fix("${gl4es_SOURCE_DIR}/src/gl/gl4es.c"
+  "(glstate->list.begin && (glstate->list.compiling || glstate->enable.texture[target-GL_TEXTURE0]))"
+  "(glstate->list.begin && (glstate->list.compiling || glstate->enable.texture[target-GL_TEXTURE0] || hardext.esversion > 1))")
+gl4es_fix("${gl4es_SOURCE_DIR}/src/gl/gl4es.c"
+  "(glstate->list.begin && (glstate->list.compiling || glstate->enable.texture[0]))"
+  "(glstate->list.begin && (glstate->list.compiling || glstate->enable.texture[0] || hardext.esversion > 1))")
 
 file(WRITE "${gl4es_SOURCE_DIR}/.gl4es_fixes" "${GL4ES_FIXES_SHA}")

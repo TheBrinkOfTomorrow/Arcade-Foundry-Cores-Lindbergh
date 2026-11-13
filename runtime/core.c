@@ -130,7 +130,8 @@ int load_elf(const char *path, uint32_t *entry)
         hle_log("loaded %s at 0x%08x\n", prog->mod_file[i], prog->mod_base[i]);
     }
     // imports resolve to their PLT stubs, which call the host layer
-    for (unsigned i = 0; i < prog->import_count; i++) wr32(prog->import_got[i], prog->import_plt[i]);
+    for (unsigned i = 0; i < prog->import_count; i++)
+        if (prog->import_got[i]) wr32(prog->import_got[i], prog->import_plt[i]);   // 0: a text relocation's stub
     return 0;
 }
 
@@ -310,6 +311,7 @@ uint64_t guest_rdtsc(CPU *c)
 {
     // timing loops spin on rdtsc without calling an import: leave them here too
     if (guest_stopping) guest_exit_thread();
+    if (clk_render) return clk_mono_ns() * 3;   // render mode: the frames' time (clock.c)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 3000000000ull + (uint64_t)ts.tv_nsec * 3;
@@ -473,8 +475,11 @@ uint32_t guest_malloc(uint32_t n)
             else large_free = next;
             blk = cur;
         } else {
-            // keep large blocks page-aligned in the heap
-            uint32_t pad = (16 - (heap_top & 15)) & 15;
+            // keep large blocks page-aligned in the heap: a pointer 8 bytes into
+            // a page, as glibc gives a large block (from mmap). Ghost Squad
+            // Evolution's own heap, malloc'd, counts on it: its first block's
+            // alignment pad is then 24 bytes, and 8 or 16 broke its block list.
+            uint32_t pad = (4096 - (heap_top & 4095)) & 4095;
             if (pad) bump(pad);
             blk = bump(total);
         }
@@ -730,6 +735,7 @@ void (*gl_check_hook)(const char *name);
 
 void hle_call(CPU *c, int i)
 {
+    if (clk_render) clk_hold();   // render mode: not between frames (clock.c)
     if (import_guest[i]) {
         // bound to another module: its code returns to the caller itself
         if (guest_stopping) guest_exit_thread();
@@ -972,10 +978,15 @@ void guest_exit_thread(void)
 
 void guest_sleep_us(uint64_t us)
 {
-    while (us && !guest_stopping) {
-        uint64_t n = us < 10000 ? us : 10000;
-        usleep((useconds_t)n);
-        us -= n;
+    if (clk_render) {
+        // render mode: until the frames' time has moved on that far (clock.c)
+        if (us) clk_sleep_until(clk_mono_ns() + us * 1000);
+    } else {
+        while (us && !guest_stopping) {
+            uint64_t n = us < 10000 ? us : 10000;
+            usleep((useconds_t)n);
+            us -= n;
+        }
     }
     if (guest_stopping) guest_exit_thread();
 }

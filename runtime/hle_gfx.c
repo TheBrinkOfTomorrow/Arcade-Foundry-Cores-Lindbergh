@@ -21,9 +21,29 @@ static uint32_t array_buffer, element_buffer;
 static int frame;
 static int shot_every;
 
-void *gl_host_proc(const char *name)
+// the host's function by its name, or by another name for it: an extension's
+// function the host has in core (glGenFramebuffersEXT as glGenFramebuffers:
+// gl4es on Metal), or a core one it has as the extension it came from
+// (glGenQueries as glGenQueriesARB): 2 Spicy asks for every GL function by name
+static void *host_proc_any(const char *name)
 {
     void *p = host_gl_proc(name);
+    size_t n = strlen(name);
+    char alt[128];
+    if (p || n >= sizeof alt - 4 || strncmp(name, "gl", 2)) return p;
+    if (n > 5 && (!strcmp(name + n - 3, "EXT") || !strcmp(name + n - 3, "ARB"))) {
+        snprintf(alt, sizeof alt, "%.*s", (int)(n - 3), name);
+        if ((p = host_gl_proc(alt))) return p;
+    }
+    snprintf(alt, sizeof alt, "%sARB", name);
+    if ((p = host_gl_proc(alt))) return p;
+    snprintf(alt, sizeof alt, "%sEXT", name);
+    return host_gl_proc(alt);
+}
+
+void *gl_host_proc(const char *name)
+{
+    void *p = host_proc_any(name);
     if (!p) hle_log("GL: host has no %s\n", name);
     return p;
 }
@@ -93,6 +113,13 @@ static void h_XCreateWindow(CPU *c)
 {
     win_w = (int)ARG(4);
     win_h = (int)ARG(5);
+#if LB_MODE_W != LB_SCREEN_W || LB_MODE_H != LB_SCREEN_H
+    // a display larger than the game draws on (GAME_MODE_SIZE: Let's Go Jungle
+    // Special's 2048x768, the game in its left 1024x768 and its other output
+    // unused): the window is the screen, and the rest falls outside it
+    if (win_w > LB_SCREEN_W) win_w = LB_SCREEN_W;
+    if (win_h > LB_SCREEN_H) win_h = LB_SCREEN_H;
+#endif
     hle_log("XCreateWindow %dx%d\n", win_w, win_h);
     RET(0x100);
 }
@@ -355,6 +382,9 @@ static void h_glXMakeCurrent(CPU *c)
     }
     host_gl_current();
     bind_drawable(ARG(1));
+    // what the runtime's own setup leaves in the error flag is not the game's
+    // (Hummer reads glGetError when it makes its render targets and exits on any)
+    while (glGetError() != GL_NO_ERROR) {}
     RET(1);
 }
 
@@ -407,7 +437,7 @@ static void h_glXSwapBuffers(CPU *c)
     static double boot_last;
     struct timespec bt;
     clock_gettime(CLOCK_MONOTONIC, &bt);
-    double boot_now = bt.tv_sec + bt.tv_nsec * 1e-9;
+    double boot_now = clk_render ? clk_mono_ns() * 1e-9 : bt.tv_sec + bt.tv_nsec * 1e-9;
     lb_boot_clock = boot_last > 0 && boot_now - boot_last < 1.25 / 60;
     boot_last = boot_now;
     if (lb_booting > 0) lb_booting--;
@@ -473,6 +503,10 @@ static void h_glutGet(CPU *c)
         static struct timespec t0;
         struct timespec t;
         clock_gettime(CLOCK_MONOTONIC, &t);
+        if (clk_render) {   // the frames' time (clock.c)
+            uint64_t ns = clk_mono_ns();
+            t.tv_sec = (time_t)(ns / 1000000000ull), t.tv_nsec = (long)(ns % 1000000000ull);
+        }
         if (!t0.tv_sec) t0 = t;
         RET((uint32_t)((t.tv_sec - t0.tv_sec) * 1000 + (t.tv_nsec - t0.tv_nsec) / 1000000));
     }
@@ -1184,6 +1218,9 @@ char *arb_inline_constants(char *src);
 char *arb_address_offsets(char *src);
 int arb_fog_env(char *src);
 char *arb_shadow_lookups(char *src);
+char *arb_program_matrices(char *src);
+char *arb_rect_lookups(char *src);
+char *arb_output_aliases(char *src);
 
 static GLint rejected_pos = -1;
 static char rejected_msg[256];
@@ -1241,12 +1278,160 @@ static void h_glFogi(CPU *c) { fog_call(c, "glFogi"); }
 static void h_glFogiv(CPU *c) { fog_call(c, "glFogiv"); }
 #endif
 
+#if defined(__APPLE__) && !defined(LB_IOS)
+char *arb_drop_back_colors(char *src);
+static int two_side_on;
+#define APPLE_BACK_COLORS(src) (two_side_on ? (src) : arb_drop_back_colors(src))
+#else
+#define APPLE_BACK_COLORS(src) (src)
+#endif
+#ifdef LB_IOS
+char *arb_program_matrices(char *src);
+char *arb_output_aliases(char *src);
+// a vertex program's text as the host takes it (after arb_lower_nv)
+#define HOST_VP_TEXT(src) arb_output_aliases(arb_program_matrices(arb_address_offsets(arb_matrix_rows(arb_inline_constants(src)))))
+#else
+#define HOST_VP_TEXT(src) APPLE_BACK_COLORS(src)
+#endif
+// Ghost Squad Evolution's lights loop over the lights of each kind
+// (arb_lower.c, inline_calls), and unrolled for eight of each its programs
+// ran in software on Apple's GL: 16 frames/s in a lit room. A vertex program
+// with such loops is kept as written, and the program bound in its place is
+// one unrolled for the counts in the environment parameters at the time
+// (four point, two spot, seven directional lights at most, eight in all),
+// made when first needed; it changes with the program bound or the counts.
+char *arb_lower_counts(char *src, const int *counts, int n);
+extern int arb_loop_env[8], arb_loop_comp[8], arb_nloops;
+#define LOOP_PROGRAMS 1024   // Ghost Squad Evolution has a few hundred (past the first 64 its game froze: Metal never finished the eight-pass one)
+static struct {
+    GLuint id;
+    char *src;   // before arb_lower.c
+    int nloops, env[8], comp[8];
+    struct { uint32_t key; GLuint id; } var[48];
+    int nvar;
+} loops[LOOP_PROGRAMS];
+static int nloop_programs;
+static float vp_env[256][4];   // the vertex programs' environment parameters
+static GLuint vp_bound;        // the game's vertex program
+
+static int loop_program(GLuint id)
+{
+    for (int i = 0; i < nloop_programs; i++)
+        if (loops[i].id == id) return i;
+    return -1;
+}
+
+// the program to bind for the game's program `id`
+static GLuint vp_for(GLuint id)
+{
+    int i = loop_program(id);
+    if (i < 0) return id;
+    int counts[8];
+    uint32_t key = 0;
+    for (int k = 0; k < loops[i].nloops; k++) {
+        float v = vp_env[loops[i].env[k]][loops[i].comp[k]];
+        counts[k] = v <= 0 ? 0 : v >= 8 ? 8 : (int)ceilf(v);
+        key = key * 9 + (uint32_t)counts[k];
+    }
+    for (int v = 0; v < loops[i].nvar; v++)
+        if (loops[i].var[v].key == key) return loops[i].var[v].id;
+    if (loops[i].nvar == 48) return id;   // the program for eight of each
+    typedef void (APIENTRY *genfn)(GLsizei, GLuint *);
+    typedef void (APIENTRY *bindfn)(GLenum, GLuint);
+    typedef void (APIENTRY *strfn)(GLenum, GLenum, GLsizei, const void *);
+    static genfn gen;
+    static bindfn bind;
+    static strfn str;
+    if (!gen) {
+        gen = (genfn)gl_host_proc("glGenProgramsARB");
+        bind = (bindfn)gl_host_proc("glBindProgramARB");
+        str = (strfn)gl_host_proc("glProgramStringARB");
+    }
+    GLuint var = 0;
+    gen(1, &var);
+    char *text = HOST_VP_TEXT(arb_lower_counts(strdup(loops[i].src), counts, loops[i].nloops));
+    bind(GL_VERTEX_PROGRAM_ARB, var);
+    str(GL_VERTEX_PROGRAM_ARB, GL_PROGRAM_FORMAT_ASCII_ARB, (GLsizei)strlen(text), text);
+    free(text);
+    if (hle_verbose) hle_log("loops: program %u variant %u counts %d %d %d (%d loops) len %zu\n", id, var, counts[0], counts[1], counts[2], loops[i].nloops, strlen(loops[i].src));
+    loops[i].var[loops[i].nvar].key = key;
+    loops[i].var[loops[i].nvar++].id = var;
+    return var;
+}
+
+static void bind_vp(void)
+{
+    typedef void (APIENTRY *bindfn)(GLenum, GLuint);
+    static bindfn bind;
+    if (!bind) bind = (bindfn)gl_host_proc("glBindProgramARB");
+    bind(GL_VERTEX_PROGRAM_ARB, vp_for(vp_bound));
+}
+
+static void h_glBindProgramARB(CPU *c)
+{
+    typedef void (APIENTRY *fn)(GLenum, GLuint);
+    static fn p;
+    if (!gl_open) RET(0);   // before the window, as the generated calls (Let's Go Jungle Special's shader setup)
+    if (!p) p = (fn)gl_host_proc("glBindProgramARB");
+    if (!p) RET(0);
+    if (gl_trace) gl_trace_call("glBindProgramARB", c);
+    if (ARG(0) != GL_VERTEX_PROGRAM_ARB) {
+        p(ARG(0), ARG(1));
+        return;
+    }
+    vp_bound = ARG(1);
+    bind_vp();
+}
+
+static void h_glProgramEnvParameter4fvARB(CPU *c)
+{
+    typedef void (APIENTRY *fn)(GLenum, GLuint, const GLfloat *);
+    static fn p;
+    if (!gl_open) RET(0);
+    if (!p) p = (fn)gl_host_proc("glProgramEnvParameter4fvARB");
+    if (!p) RET(0);
+    if (gl_trace) gl_trace_call("glProgramEnvParameter4fvARB", c);
+    const GLfloat *v = (const GLfloat *)G(ARG(2));
+    p(ARG(0), ARG(1), v);
+    if (ARG(0) != GL_VERTEX_PROGRAM_ARB || ARG(1) >= 256 || !memcmp(vp_env[ARG(1)], v, 16)) return;
+    memcpy(vp_env[ARG(1)], v, 16);
+    int i = loop_program(vp_bound);
+    for (int k = 0; i >= 0 && k < loops[i].nloops; k++)
+        if (loops[i].env[k] == (int)ARG(1)) { bind_vp(); break; }
+}
+
+// after the game's program `id` is given its text (`src`, not yet lowered)
+static void vp_loops_check(GLuint id, const char *src)
+{
+    int i = loop_program(id);
+    if (i >= 0) {   // a new text for it: its old variants go
+        typedef void (APIENTRY *delfn)(GLsizei, const GLuint *);
+        delfn del = (delfn)gl_host_proc("glDeleteProgramsARB");
+        for (int v = 0; v < loops[i].nvar; v++) del(1, &loops[i].var[v].id);
+        free(loops[i].src);
+        loops[i] = loops[--nloop_programs];
+    }
+    int known = arb_nloops > 0;
+    for (int k = 0; k < arb_nloops; k++) known &= arb_loop_env[k] >= 0 && arb_loop_env[k] < 256;
+    if (!known || nloop_programs == LOOP_PROGRAMS) return;
+    if (hle_verbose) hle_log("loops: program %u has %d loops env %d.%d\n", id, arb_nloops, arb_loop_env[0], arb_loop_comp[0]);
+    i = nloop_programs++;
+    memset(&loops[i], 0, sizeof loops[i]);
+    loops[i].id = id;
+    loops[i].src = strdup(src);
+    loops[i].nloops = arb_nloops;
+    memcpy(loops[i].env, arb_loop_env, sizeof arb_loop_env);
+    memcpy(loops[i].comp, arb_loop_comp, sizeof arb_loop_comp);
+}
+
 // ARB assembly programs (Cg's arbvp1/arbfp1 output): report the ones the host rejects
 static void h_glProgramStringARB(CPU *c)
 {
     typedef void (APIENTRY *fn)(GLenum, GLenum, GLsizei, const void *);
     static fn p;
+    if (!gl_open) RET(0);
     if (!p) p = (fn)gl_host_proc("glProgramStringARB");
+    if (!p) RET(0);
     if (gl_trace) gl_trace_call("glProgramStringARB", c);
     if (ARG(0) == 0x8870) wr32(c->r[ESP] + 4, GL_FRAGMENT_PROGRAM_ARB);   // NV_fragment_program's target
     char *src = NULL;
@@ -1258,11 +1443,29 @@ static void h_glProgramStringARB(CPU *c)
         src[ARG(2)] = 0;
     }
 #ifdef LB_IOS
+    char *as_written = NULL;
+    if (ARG(0) == GL_VERTEX_PROGRAM_ARB) {   // as on Apple's GL below: the game's own program gets the text
+        typedef void (APIENTRY *bindfn)(GLenum, GLuint);
+        ((bindfn)gl_host_proc("glBindProgramARB"))(GL_VERTEX_PROGRAM_ARB, vp_bound);
+        if (strstr(src, "CAL") && strstr(src, "RET")) as_written = strdup(src);
+    }
+    arb_nloops = 0;
     src = arb_address_offsets(arb_matrix_rows(arb_inline_constants(arb_lower_nv(src))));   // gl4es knows ARB only (arb_lower.c)
-    src = arb_shadow_lookups(src);
+    src = arb_output_aliases(arb_rect_lookups(arb_shadow_lookups(arb_program_matrices(src))));
     if (arb_fog_env(src)) fog_env_update();
 #else
-    if (!host_has_nv_options()) src = arb_lower_nv(src);
+    // Apple's GL takes NVIDIA's options but not their branches on Metal (it
+    // drew such a program in software, wrongly: Ghost Squad Evolution's lights)
+    char *as_written = NULL;
+    if (ARG(0) == GL_VERTEX_PROGRAM_ARB) {
+        // the game's own program is the one the text goes to
+        typedef void (APIENTRY *bindfn)(GLenum, GLuint);
+        ((bindfn)gl_host_proc("glBindProgramARB"))(GL_VERTEX_PROGRAM_ARB, vp_bound);
+        if (strstr(src, "CAL") && strstr(src, "RET")) as_written = strdup(src);
+    }
+    arb_nloops = 0;
+    if (!host_has_nv_options() || strstr(src, "BRA") || strstr(src, "CAL ")) src = arb_lower_nv(src);
+    if (ARG(0) == GL_VERTEX_PROGRAM_ARB) src = APPLE_BACK_COLORS(src);
 #endif
     if (af_debug_env("LB_SHADER_DUMP")) {   // before the host sees it, in case it crashes on it
         static int seq;
@@ -1275,6 +1478,11 @@ static void h_glProgramStringARB(CPU *c)
 #ifdef LB_IOS
     arb_fallback(p, ARG(0), ARG(1));
 #endif
+    if (ARG(0) == GL_VERTEX_PROGRAM_ARB) {
+        vp_loops_check(vp_bound, as_written ? as_written : "");
+        free(as_written);
+        bind_vp();
+    }
     GLint pos = -1;
     glGetIntegerv(GL_PROGRAM_ERROR_POSITION_ARB, &pos);
 #ifdef LB_IOS
@@ -1312,6 +1520,15 @@ static void h_glBindFramebuffer(CPU *c) { bind_framebuffer(c, "glBindFramebuffer
 static PFNGLVERTEXATTRIB4FARBPROC attrib4f;
 static void set_alias(GLuint index, float x, float y, float z, float w)
 {
+#ifdef LB_IOS
+    // gl4es with more than 8 attributes (mtlgles has 16) lays the conventional
+    // inputs out as NVIDIA does (texcoord 0 is attribute 8): the call is the
+    // alias already. A glVertexAttrib between glBegin and glEnd would end the
+    // primitive there (gl4es flushes it), and each of Harley-Davidson's text
+    // quads came out with one texcoord: black
+    (void)index, (void)x, (void)y, (void)z, (void)w;
+    return;
+#endif
     if (!attrib4f) attrib4f = (PFNGLVERTEXATTRIB4FARBPROC)gl_host_proc("glVertexAttrib4fARB");
     attrib4f(index, x, y, z, w);
 }
@@ -1520,11 +1737,12 @@ static void rect_use(CPU *c, const char *name)
     rect_current = prog;
     rect_update();
 }
+static void rect_env_update(void);
 static void rect_target(CPU *c, const char *name)
 {
     uint32_t target = ARG(0);
     rect_call(c, name);
-    if (target == GL_TEXTURE_RECTANGLE_ARB) rect_update();
+    if (target == GL_TEXTURE_RECTANGLE_ARB) rect_update(), rect_env_update();
 }
 static void h_glUseProgram(CPU *c) { rect_use(c, "glUseProgram"); }
 static void h_glUseProgramObjectARB(CPU *c) { rect_use(c, "glUseProgramObjectARB"); }
@@ -1533,7 +1751,8 @@ static void h_glUseProgramObjectARB(CPU *c) { rect_use(c, "glUseProgramObjectARB
 // (host_core_ios.m sizes the format). They were once kept out of gl4es and
 // attached as stand-in renderbuffers, which left the shadow map with no
 // image to sample: the car was drawn all in shadow (#78).
-static void h_glTexImage2D(CPU *c) { rect_target(c, "glTexImage2D"); }
+static void depth_stencil_format(CPU *c);
+static void h_glTexImage2D(CPU *c) { depth_stencil_format(c); rect_target(c, "glTexImage2D"); }
 // The game attaches a depth+stencil texture to the depth attachment and then
 // to the stencil attachment; gl4es's stencil path remakes the texture as a
 // stencil one, which OpenGL ES 3 refuses (GL_INVALID_ENUM, the framebuffer
@@ -1590,6 +1809,24 @@ static void shadow_env_update(void)
         if (i && i->compare) v[0] = 1, v[1] = i->border, v[2] = (GLfloat)i->border_s, v[3] = (GLfloat)i->border_t;
         if (memcmp(v, set[u], sizeof v)) env(GL_FRAGMENT_PROGRAM_ARB, SHADOW_ENV + u, v[0], v[1], v[2], v[3]), memcpy(set[u], v, sizeof v);
     }
+}
+// Rectangle textures in ARB fragment programs (arb_lower.c,
+// arb_rect_lookups): program environment parameter 24 + unit is 1 / the size
+// of the rectangle texture bound on that unit (units 0-7), set when one is
+// bound or given an image.
+#define RECT_ENV 24
+static void rect_env_update(void)
+{
+    typedef void (APIENTRY *envfn)(GLenum, GLuint, GLfloat, GLfloat, GLfloat, GLfloat);
+    typedef void (APIENTRY *levelfn)(GLenum, GLint, GLenum, GLint *);
+    static envfn env;
+    static levelfn level;
+    if (!env) env = (envfn)gl_host_proc("glProgramEnvParameter4fARB"), level = (levelfn)gl_host_proc("glGetTexLevelParameteriv");
+    if (!env || !level || active_unit < 0 || active_unit > 7) return;
+    GLint w = 0, h = 0;
+    level(GL_TEXTURE_RECTANGLE_ARB, 0, GL_TEXTURE_WIDTH, &w);
+    level(GL_TEXTURE_RECTANGLE_ARB, 0, GL_TEXTURE_HEIGHT, &h);
+    env(GL_FRAGMENT_PROGRAM_ARB, RECT_ENV + (GLuint)active_unit, w > 0 ? 1.0f / (GLfloat)w : 1.0f, h > 0 ? 1.0f / (GLfloat)h : 1.0f, 1, 1);
 }
 static void h_glBindTexture(CPU *c)
 {
@@ -1677,6 +1914,29 @@ static void h_glDeleteTextures(CPU *c)
 static void h_glCopyTexImage2D(CPU *c) { rect_target(c, "glCopyTexImage2D"); }
 #endif
 
+// A depth texture asked for as depth with depth+stencil data (format
+// GL_DEPTH_STENCIL, type UNSIGNED_INT_24_8: Ghost Squad Evolution's shadow
+// map and render targets), which NVIDIA takes; on Apple's GL the texture is
+// left incomplete and samples as 0 (the whole scene in shadow), and gl4es
+// refuses it: it is made DEPTH24_STENCIL8.
+static void depth_stencil_format(CPU *c)
+{
+    uint32_t internal = ARG(2);
+    if (ARG(6) == GL_DEPTH_STENCIL && (internal == GL_DEPTH_COMPONENT || internal == GL_DEPTH_COMPONENT16 ||
+                                       internal == GL_DEPTH_COMPONENT24 || internal == GL_DEPTH_COMPONENT32))
+        wr32(c->r[ESP] + 4 + 4 * 2, GL_DEPTH24_STENCIL8);
+}
+#ifndef LB_IOS
+static void h_glTexImage2D_depth(CPU *c)
+{
+    static hle_fn gen;
+    if (!gen)
+        for (const hle_entry *e = gl_gen_table; e->name && !gen; e++)
+            if (!strcmp(e->name, "glTexImage2D")) gen = e->fn;
+    depth_stencil_format(c);
+    gen(c);
+}
+#endif
 // NVIDIA aliases the conventional arrays onto generic attributes (normal 2,
 // colour 3 and 4, texcoord n 8+n), and the vertex programs read those
 // (alias_vertex_inputs). Sega Race TV feeds its arrays the conventional way
@@ -1789,6 +2049,10 @@ static const hle_entry gfx_special[] = {
     {"glAttachShader", h_glAttachShader}, {"glAttachObjectARB", h_glAttachObjectARB},
     {"glMapBuffer", h_glMapBuffer}, {"glMapBufferARB", h_glMapBufferARB},
     {"glUnmapBuffer", h_glUnmapBuffer}, {"glUnmapBufferARB", h_glUnmapBufferARB},
+#ifndef LB_IOS
+    {"glTexImage2D", h_glTexImage2D_depth},
+#endif
+    {"glBindProgramARB", h_glBindProgramARB}, {"glProgramEnvParameter4fvARB", h_glProgramEnvParameter4fvARB},
 #ifdef LB_IOS
     {"glUseProgram", h_glUseProgram}, {"glUseProgramObjectARB", h_glUseProgramObjectARB},
     {"glBindTexture", h_glBindTexture}, {"glTexImage2D", h_glTexImage2D},
@@ -1970,7 +2234,19 @@ static void h_glTrackMatrixNV(CPU *c)
 
 // NV_fragment_program's target is ARB's on the host (its programs are translated)
 static GLenum nv_target(GLenum t) { return t == 0x8870 ? GL_FRAGMENT_PROGRAM_ARB : t; }
-static void h_glEnable(CPU *c) { glEnable(nv_target(ARG(0))); }
+// two-sided lighting for vertex programs: until a game turns it on, their
+// back colours are taken out on Apple's GL (arb_lower.c, arb_drop_back_colors)
+#if !(defined(__APPLE__) && !defined(LB_IOS))
+static int two_side_on;
+#endif
+static void h_glEnable(CPU *c)
+{
+    if (ARG(0) == GL_VERTEX_PROGRAM_TWO_SIDE_ARB && !two_side_on) {
+        two_side_on = 1;
+        hle_log("vertex programs: two-sided lighting on; programs loaded before have no back colours\n");
+    }
+    glEnable(nv_target(ARG(0)));
+}
 static void h_glDisable(CPU *c) { glDisable(nv_target(ARG(0))); }
 static void h_glIsEnabled(CPU *c) { RET(glIsEnabled(nv_target(ARG(0)))); }
 static void h_glBindProgramNV(CPU *c) { nv_procs(); arb_bind(nv_target(ARG(0)), ARG(1)); }
@@ -2005,31 +2281,38 @@ static const hle_entry gl_emulated[] = {
     {NULL, NULL},
 };
 
-static void h_glXGetProcAddressARB(CPU *c)
+static uint32_t gl_proc(const char *name)
 {
-    const char *name = G(ARG(0));
     hle_fn f = NULL;
     for (const hle_entry *e = gl_emulated; e->name; e++)
-        if (!strcmp(e->name, name)) RET(magic_register(e->fn, name));
+        if (!strcmp(e->name, name)) return magic_register(e->fn, name);
     for (const hle_entry *e = gfx_special; e->name && !f; e++)
         if (!strcmp(e->name, name)) f = e->fn;
     for (const hle_entry *e = gl_gen_table; e->name && !f; e++)
         if (!strcmp(e->name, name)) f = e->fn;
-    if (!f || !host_gl_proc(name)) {
-        if (hle_verbose) hle_log("glXGetProcAddress %s: not provided\n", name);
-        RET(0);
-    }
-    RET(magic_register(f, name));
+    // the host is asked only once it has a context: gl4es answers few names
+    // before (2 Spicy asks for them all before it makes its window); the
+    // wrapper looks the function up when it is first called
+    return f && (!gl_open || host_proc_any(name)) ? magic_register(f, name) : 0;
+}
+
+static void h_glXGetProcAddressARB(CPU *c)
+{
+    const char *name = G(ARG(0));
+    uint32_t p = gl_proc(name);
+    if (!p && hle_verbose) hle_log("glXGetProcAddress %s: not provided\n", name);
+    RET(p);
 }
 
 static const hle_entry glut_table[] = {
-    {"glutInit", h_ret0}, {"glutInitDisplayMode", h_ret0}, {"glutInitWindowPosition", h_ret0},
+    {"glutInit", h_ret0}, {"glutFullScreen", h_ret0}, {"glutInitDisplayMode", h_ret0}, {"glutInitWindowPosition", h_ret0},
     {"glutInitWindowSize", h_glutInitWindowSize}, {"glutGameModeString", h_glutGameModeString},
     {"glutEnterGameMode", h_glutEnterGameMode}, {"glutLeaveGameMode", h_ret0},
     {"glutCreateWindow", h_glutCreateWindow}, {"glutDisplayFunc", h_glutDisplayFunc},
     {"glutIdleFunc", h_glutIdleFunc}, {"glutKeyboardFunc", h_glutKeyboardFunc},
     {"glutPostRedisplay", h_glutPostRedisplay}, {"glutSwapBuffers", h_glutSwapBuffers},
     {"glutMainLoop", h_glutMainLoop}, {"glutSetCursor", h_ret0},
+    {"glutEntryFunc", h_ret0}, {"glutJoystickFunc", h_ret0}, {"glutGetModifiers", h_ret0},
     {"glutMainLoopEvent", h_glutMainLoopEvent}, {"glutGet", h_glutGet}, {"glutBitmapCharacter", h_glutBitmapCharacter},
     {"glutBitmapWidth", h_glutBitmapWidth}, {"glutSolidTeapot", h_glutSolidTeapot}, {"gluPerspective", h_gluPerspective},
     {"gluOrtho2D", h_gluOrtho2D}, {"gluLookAt", h_gluLookAt}, {"gluErrorString", h_gluErrorString},
@@ -2039,8 +2322,101 @@ static const hle_entry glut_table[] = {
     {NULL, NULL},
 };
 
+// ---- Hummer's further X11, GLX and GLU calls ----------------------------------------------------
+static void h_XAllocWMHints(CPU *c) { RET(guest_calloc(1, 36)); }
+static void h_XEventsQueued(CPU *c) { h_XPending(c); }
+// XPeekEvent: the next event, left in the queue (none: a NoExpose)
+static void h_XPeekEvent(CPU *c)
+{
+    pthread_mutex_lock(&qlock);
+    if (qhead == qtail) {
+        memset(G(ARG(1)), 0, 96);
+        wr32(ARG(1), 14);
+    } else
+        memcpy(G(ARG(1)), &queue[qhead % 64], 96);
+    pthread_mutex_unlock(&qlock);
+    RET(0);
+}
+// XGetGeometry(display, drawable, root, x, y, width, height, border, depth): the window
+static void h_XGetGeometry(CPU *c)
+{
+    static const int at[7] = {2, 3, 4, 5, 6, 7, 8};
+    uint32_t v[7] = {0x100, 0, 0, (uint32_t)win_w, (uint32_t)win_h, 0, 24};
+    for (int k = 0; k < 7; k++)
+        if (ARG(at[k])) wr32(ARG(at[k]), v[k]);
+    RET(1);
+}
+static void h_glXQueryVersion(CPU *c)
+{
+    if (ARG(1)) wr32(ARG(1), 1);
+    if (ARG(2)) wr32(ARG(2), 4);
+    RET(1);
+}
+// gluProject(objx, objy, objz, model, proj, view, winx, winy, winz) and gluUnProject,
+// as GLU computes them (doubles on the stack)
+static void mat_mul_vec(const double *m, const double *in, double *out)
+{
+    for (int i = 0; i < 4; i++)
+        out[i] = m[i] * in[0] + m[4 + i] * in[1] + m[8 + i] * in[2] + m[12 + i] * in[3];
+}
+static void read_mat(uint32_t a, double *m) { for (int i = 0; i < 16; i++) m[i] = u2d(rd64(a + 8 * i)); }
+static void h_gluProject(CPU *c)
+{
+    double model[16], proj[16], in[4] = {ARGD(0), ARGD(2), ARGD(4), 1}, t[4], o[4];
+    read_mat(ARG(6), model);
+    read_mat(ARG(7), proj);
+    uint32_t vp = ARG(8);
+    mat_mul_vec(model, in, t);
+    mat_mul_vec(proj, t, o);
+    if (o[3] == 0) RET(0);
+    for (int i = 0; i < 3; i++) o[i] = o[i] / o[3] * 0.5 + 0.5;
+    wr64(ARG(9), d2u(o[0] * (int32_t)rd32(vp + 8) + (int32_t)rd32(vp)));
+    wr64(ARG(10), d2u(o[1] * (int32_t)rd32(vp + 12) + (int32_t)rd32(vp + 4)));
+    wr64(ARG(11), d2u(o[2]));
+    RET(1);
+}
+static int invert4(const double *m, double *inv)
+{
+    double a[4][8];
+    for (int r = 0; r < 4; r++)
+        for (int k = 0; k < 8; k++) a[r][k] = k < 4 ? m[k * 4 + r] : (k - 4 == r);
+    for (int col = 0; col < 4; col++) {
+        int piv = col;
+        for (int r = col + 1; r < 4; r++) if (fabs(a[r][col]) > fabs(a[piv][col])) piv = r;
+        if (a[piv][col] == 0) return 0;
+        for (int k = 0; k < 8; k++) { double x = a[col][k]; a[col][k] = a[piv][k]; a[piv][k] = x; }
+        double d = a[col][col];
+        for (int k = 0; k < 8; k++) a[col][k] /= d;
+        for (int r = 0; r < 4; r++)
+            if (r != col) { double f = a[r][col]; for (int k = 0; k < 8; k++) a[r][k] -= f * a[col][k]; }
+    }
+    for (int r = 0; r < 4; r++) for (int k = 0; k < 4; k++) inv[k * 4 + r] = a[r][k + 4];
+    return 1;
+}
+static void h_gluUnProject(CPU *c)
+{
+    double model[16], proj[16], mp[16], inv[16], o[4];
+    read_mat(ARG(6), model);
+    read_mat(ARG(7), proj);
+    uint32_t vp = ARG(8);
+    for (int col = 0; col < 4; col++) mat_mul_vec(proj, model + 4 * col, mp + 4 * col);
+    if (!invert4(mp, inv)) RET(0);
+    double in[4] = {(ARGD(0) - (int32_t)rd32(vp)) / (int32_t)rd32(vp + 8) * 2 - 1,
+                    (ARGD(2) - (int32_t)rd32(vp + 4)) / (int32_t)rd32(vp + 12) * 2 - 1, ARGD(4) * 2 - 1, 1};
+    mat_mul_vec(inv, in, o);
+    if (o[3] == 0) RET(0);
+    for (int i = 0; i < 3; i++) wr64(ARG(9 + i), d2u(o[i] / o[3]));
+    RET(1);
+}
+
 static const hle_entry gfx_table[] = {
     {"XOpenDisplay", h_XOpenDisplay}, {"XCreateWindow", h_XCreateWindow}, {"XMapWindow", h_XMapWindow},
+    {"XAllocWMHints", h_XAllocWMHints}, {"XEventsQueued", h_XEventsQueued}, {"XPeekEvent", h_XPeekEvent},
+    {"XGetGeometry", h_XGetGeometry}, {"XChangeKeyboardControl", h_ret0}, {"XChangeProperty", h_ret0},
+    {"XChangeWindowAttributes", h_ret0}, {"XConfigureWindow", h_ret0}, {"XFreeColormap", h_ret0},
+    {"XLookupKeysym", h_ret0}, {"XRefreshKeyboardMapping", h_ret0}, {"XSelectInput", h_ret0},
+    {"XSetWMNormalHints", h_ret0}, {"XUndefineCursor", h_ret0}, {"glXIsDirect", h_ret1},
+    {"glXQueryVersion", h_glXQueryVersion}, {"glXWaitX", h_ret0}, {"gluProject", h_gluProject}, {"gluUnProject", h_gluUnProject},
     {"XPending", h_XPending}, {"XNextEvent", h_XNextEvent}, {"XTranslateCoordinates", h_XTranslateCoordinates},
     {"XLookupString", h_XLookupString}, {"XCreateColormap", h_retid}, {"XCreateBitmapFromData", h_retid},
     {"XCreatePixmapCursor", h_retid}, {"XCreateFontCursor", h_retid}, {"XDefineCursor", h_ret0},

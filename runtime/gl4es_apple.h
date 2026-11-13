@@ -9,7 +9,9 @@
 // vertex programs use program.local up to 164 (Let's Go Jungle's, compiled by
 // Cg at run time, up to 233: its skinned models), its fragment programs up to 49;
 // and more vertex env parameters: OutRun 2 SP's NV vertex programs read c[]
-// up to 212 (NV_vertex_program2 has 256; gl4es kept 96 and dropped the rest)
+// up to 212 (NV_vertex_program2 has 256; gl4es kept 96 and dropped the rest);
+// and 32 fragment env parameters, the runtime's own in the last ones (shadow
+// 18-21, fog 22-23, Ghost Squad Evolution's rectangle scales 24-31)
 #define _GL4ES_MAIN_CONFIG_H
 #define SYS_proxy 9999
 #define MAX_EVAL_ORDER 30
@@ -26,6 +28,6 @@
 #define MAX_ARB_MATRIX 8
 #define MAX_VTX_PROG_ENV_PARAMS 256
 #define MAX_VTX_PROG_LOC_PARAMS 256
-#define MAX_FRG_PROG_ENV_PARAMS 24
+#define MAX_FRG_PROG_ENV_PARAMS 32
 #define MAX_FRG_PROG_LOC_PARAMS 64
 #define MAX_DRAW_BUFFERS 16

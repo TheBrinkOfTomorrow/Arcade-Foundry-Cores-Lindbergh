@@ -1,0 +1,18 @@
+# Game functions the runtime replaces (runtime/hle_lindbergh.c, ovr_<name>).
+# chopperM.elf has no symbols: "0xaddress name". Its AM library is the build
+# Race TV's program has (amDongle 0.12, amDipsw 0.03, amJvs 0.46), whose
+# symbols place these functions: found by their code, addresses masked
+# (tools/match_functions.py).
+# The security dongle and the DIP switches, as for HotD4
+0x8395ede amDongleInit
+0x8394999 amDongleIsAvailable
+0x839538f amDongleUpdate
+0x839472c amDipswInit
+0x83947b0 amDipswExit
+0x8394825 amDipswGetData
+0x839489b amDipswSetLed
+# its own gettid makes the system call (int 0x80), as Race TV's
+0x83f7624 gettid
+# the keychip's decryption, taken as done (its check is patched: patches.txt)
+0x8395893 amDongleDecryptEx
+0x83950c7 amDongleSetIv

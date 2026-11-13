@@ -1,0 +1,15 @@
+# Game functions the runtime replaces (runtime/hle_lindbergh.c, ovr_<name>)
+# The security dongle and the DIP switches, as for HotD4
+amDongleInit
+amDongleIsAvailable
+amDongleUpdate
+amDipswInit
+amDipswExit
+amDipswGetData
+amDipswSetLed
+# The keychip user data, with the game ID from keychip.txt
+amDongleUserInfoEx
+# Its report of the heap at boot, for the debug trace (minutes here)
+_Z14show_heap_infov
+# snd_util.so's own gettid makes the system call directly (int 0x80)
+gettid

@@ -1,0 +1,5 @@
+# Shared libraries the game ships in disk1/vsg_l, translated with it: file, load base
+# (above vsg, whose data and its 40 MB heap reach 0x0aeb0f60).
+# Its sound: snd_util.so (opened with dlopen) on CRI's ADX library over OpenAL.
+snd_util.so 0x0b000000
+librnalindbergh_jr.so 0x0b100000

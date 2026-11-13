@@ -1,0 +1,2 @@
+# The game ID its keychip reports (the game checks it at boot)
+SBST

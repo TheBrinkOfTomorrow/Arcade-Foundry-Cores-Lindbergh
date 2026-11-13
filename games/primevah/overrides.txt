@@ -1,0 +1,2 @@
+# Game functions the runtime replaces (runtime/hle_lindbergh.c, ovr_<name>);
+# main.exe has no symbols: "0xaddress name"
